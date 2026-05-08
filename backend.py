@@ -248,6 +248,14 @@ class SectorWorker(QThread):
                     if write_time < self.threshold_s:
                         chunk["status"] = "green"
                         self._queue_status(i, "green")
+                        # Rename file to GOOD_ prefix
+                        new_filename = f"GOOD_{chunk['filename']}"
+                        new_filepath = os.path.join(self._sectors_dir(), new_filename)
+                        try:
+                            os.rename(filepath, new_filepath)
+                            chunk["filename"] = new_filename
+                        except Exception as rename_err:
+                            self.log_message.emit(f"Could not rename chunk {i + 1}: {rename_err}")
                         self.log_message.emit(
                             f"GOOD chunk {i + 1}/{self.total_chunks} "
                             f"(write time: {write_time:.3f}s)"
