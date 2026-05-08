@@ -1,0 +1,273 @@
+import json
+import os
+import time
+from datetime import datetime
+from shutil import disk_usage
+from PySide6.QtCore import QThread, Signal
+
+SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_state.json")
+
+MB = 1024 * 1024
+
+class SectorWorker(QThread):
+    """
+    Two-phase sector isolation worker.
+
+    Phase 1 (allocation): Creates dummy files (seek + single byte) to reserve
+    all available disk space. Squares go White -> Yellow.
+
+    Phase 2 (verification): Overwrites each dummy file with a real write
+    (truncate) and measures write time. Squares go Yellow -> Green or Red.
+    """
+
+    # Signal(int chunk_index, str status)  status: "yellow", "green", "red"
+    chunk_status_changed = Signal(int, str)
+    # Signal(int current, int total)
+    progress_changed = Signal(int, int)
+    # Signal(str message)
+    log_message = Signal(str)
+    # Signal()
+    work_finished = Signal()
+
+    def __init__(self, disk_path, chunk_size_mb, threshold_s, parent=None):
+        super().__init__(parent)
+        self.disk_path = disk_path
+        self.chunk_size_bytes = int(chunk_size_mb * MB)
+        self.threshold_s = threshold_s
+
+        self.total_chunks = 0
+        # Each entry: {"index": int, "status": "white"|"yellow"|"green"|"red", "filename": str}
+        self.chunks = []
+
+        self._paused = False
+        self._stopped = False
+
+        # Which phase we are in and where we left off
+        self.current_phase = 1  # 1 = allocation, 2 = verification
+        self.current_chunk_index = 0  # next chunk to process in current phase
+
+    # ------------------------------------------------------------------ state
+    def save_state(self):
+        state = {
+            "disk_path": self.disk_path,
+            "chunk_size_mb": self.chunk_size_bytes / MB,
+            "threshold_s": self.threshold_s,
+            "total_chunks": self.total_chunks,
+            "current_phase": self.current_phase,
+            "current_chunk_index": self.current_chunk_index,
+            "chunks": self.chunks,
+        }
+        try:
+            with open(SESSION_FILE, "w") as f:
+                json.dump(state, f, indent=2)
+            self.log_message.emit(f"Session state saved ({len(self.chunks)} chunks)")
+        except Exception as e:
+            self.log_message.emit(f"Failed to save session state: {e}")
+
+    @staticmethod
+    def load_state():
+        """Returns a dict with saved state or None."""
+        if os.path.isfile(SESSION_FILE):
+            try:
+                with open(SESSION_FILE, "r") as f:
+                    return json.load(f)
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def clear_state():
+        if os.path.isfile(SESSION_FILE):
+            os.remove(SESSION_FILE)
+
+    @classmethod
+    def from_state(cls, state, parent=None):
+        """Reconstruct a worker from saved state."""
+        worker = cls(
+            disk_path=state["disk_path"],
+            chunk_size_mb=state["chunk_size_mb"],
+            threshold_s=state["threshold_s"],
+            parent=parent,
+        )
+        worker.total_chunks = state["total_chunks"]
+        worker.chunks = state["chunks"]
+        worker.current_phase = state["current_phase"]
+        worker.current_chunk_index = state["current_chunk_index"]
+        return worker
+
+    # --------------------------------------------------------------- helpers
+    def _sectors_dir(self):
+        d = os.path.join(self.disk_path, "sectors")
+        if not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        return d
+
+    def _chunk_filepath(self, chunk):
+        return os.path.join(self._sectors_dir(), chunk["filename"])
+
+    @staticmethod
+    def _padded_name(index):
+        return str(index).rjust(20, "0")
+
+    def _wait_if_paused(self):
+        while self._paused and not self._stopped:
+            time.sleep(0.1)
+
+    # ------------------------------------------------------------------- run
+    def run(self):
+        try:
+            self._run_internal()
+        except Exception as e:
+            self.log_message.emit(f"Worker error: {e}")
+        finally:
+            self.save_state()
+            self.work_finished.emit()
+
+    def _run_internal(self):
+        sectors_dir = self._sectors_dir()
+
+        # ------------------------------------------------------ calculate total chunks if fresh start
+        if self.total_chunks == 0:
+            free = disk_usage(self.disk_path).free
+            self.total_chunks = max(1, int(free // self.chunk_size_bytes))
+            self.chunks = []
+            for i in range(self.total_chunks):
+                self.chunks.append({
+                    "index": i,
+                    "status": "white",
+                    "filename": f"{self._padded_name(i + 1)}.dat",
+                })
+            self.current_phase = 1
+            self.current_chunk_index = 0
+            self.log_message.emit(
+                f"Calculated {self.total_chunks} chunks "
+                f"({self.chunk_size_bytes / MB:.1f} MB each) "
+                f"for {free / MB:.1f} MB free space"
+            )
+            self.save_state()
+
+        # Emit existing chunk states (for resume)
+        total_work = self.total_chunks * 2  # phase1 + phase2
+        for chunk in self.chunks:
+            if chunk["status"] != "white":
+                self.chunk_status_changed.emit(chunk["index"], chunk["status"])
+
+        # ------------------------------------------------------ Phase 1: Allocation
+        if self.current_phase == 1:
+            self.log_message.emit("Phase 1: Allocating dummy files...")
+            for i in range(self.current_chunk_index, self.total_chunks):
+                self._wait_if_paused()
+                if self._stopped:
+                    self.current_chunk_index = i
+                    return
+
+                chunk = self.chunks[i]
+                filepath = self._chunk_filepath(chunk)
+
+                try:
+                    with open(filepath, "wb") as f:
+                        f.seek(self.chunk_size_bytes - 1)
+                        f.write(b"\0")
+                    chunk["status"] = "yellow"
+                    self.chunk_status_changed.emit(i, "yellow")
+                    self.log_message.emit(f"Allocated chunk {i + 1}/{self.total_chunks}")
+                except Exception as e:
+                    # If we can't even allocate, mark red immediately
+                    chunk["status"] = "red"
+                    self.chunk_status_changed.emit(i, "red")
+                    self.log_message.emit(f"Failed to allocate chunk {i + 1}: {e}")
+
+                completed = i + 1
+                self.progress_changed.emit(completed, total_work)
+
+                # Save state periodically (every 50 chunks)
+                if (i + 1) % 50 == 0:
+                    self.current_chunk_index = i + 1
+                    self.save_state()
+
+            # Phase 1 complete
+            self.current_phase = 2
+            self.current_chunk_index = 0
+            self.save_state()
+
+        # ------------------------------------------------------ Phase 2: Verification
+        if self.current_phase == 2:
+            self.log_message.emit("Phase 2: Verifying sectors with real writes...")
+            for i in range(self.current_chunk_index, self.total_chunks):
+                self._wait_if_paused()
+                if self._stopped:
+                    self.current_chunk_index = i
+                    return
+
+                chunk = self.chunks[i]
+
+                # Skip chunks that already failed allocation
+                if chunk["status"] == "red":
+                    completed = self.total_chunks + i + 1
+                    self.progress_changed.emit(completed, total_work)
+                    continue
+
+                filepath = self._chunk_filepath(chunk)
+
+                try:
+                    start = datetime.now()
+                    with open(filepath, "wb") as out:
+                        out.truncate(self.chunk_size_bytes)
+                    write_time = (datetime.now() - start).total_seconds()
+
+                    if write_time < self.threshold_s:
+                        chunk["status"] = "green"
+                        self.chunk_status_changed.emit(i, "green")
+                        self.log_message.emit(
+                            f"GOOD chunk {i + 1}/{self.total_chunks} "
+                            f"(write time: {write_time:.3f}s)"
+                        )
+                    else:
+                        chunk["status"] = "red"
+                        self.chunk_status_changed.emit(i, "red")
+                        self.log_message.emit(
+                            f"BAD chunk {i + 1}/{self.total_chunks} "
+                            f"(write time: {write_time:.3f}s, threshold: {self.threshold_s}s)"
+                        )
+                except Exception as e:
+                    # Real write failed — create dummy to hold the space and mark red
+                    chunk["status"] = "red"
+                    self.chunk_status_changed.emit(i, "red")
+                    self.log_message.emit(
+                        f"FAILED chunk {i + 1}/{self.total_chunks}: {e}"
+                    )
+                    try:
+                        with open(filepath, "wb") as f:
+                            f.seek(self.chunk_size_bytes - 1)
+                            f.write(b"\0")
+                    except Exception:
+                        pass
+
+                completed = self.total_chunks + i + 1
+                self.progress_changed.emit(completed, total_work)
+
+                # Save state periodically (every 50 chunks)
+                if (i + 1) % 50 == 0:
+                    self.current_chunk_index = i + 1
+                    self.save_state()
+
+            self.log_message.emit("Verification complete!")
+
+            # Final summary
+            good = sum(1 for c in self.chunks if c["status"] == "green")
+            bad = sum(1 for c in self.chunks if c["status"] == "red")
+            self.log_message.emit(f"Summary: {good} GOOD, {bad} BAD out of {self.total_chunks}")
+
+    # --------------------------------------------------------------- controls
+    def pause(self):
+        self._paused = True
+        self.log_message.emit("Paused")
+
+    def resume(self):
+        self._paused = False
+        self.log_message.emit("Resumed")
+
+    def stop(self):
+        self._stopped = True
+        self._paused = False
+        self.log_message.emit("Stopping...")
