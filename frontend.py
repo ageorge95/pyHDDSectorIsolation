@@ -1,7 +1,7 @@
 import math
 import os
-from PySide6.QtCore import Qt, Slot, QTimer
-from PySide6.QtGui import QColor, QPainter, QBrush, QPen, QIcon
+from PySide6.QtCore import Slot, QTimer
+from PySide6.QtGui import QColor, QPainter, QIcon, QImage
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -32,43 +32,98 @@ def get_running_path(relative_path):
         return relative_path
 
 class SectorGridWidget(QWidget):
-    """Custom widget that draws a grid of colored squares representing chunks."""
+    """
+    Custom widget that draws a grid of colored squares representing chunks.
+
+    Rendering strategy: each chunk maps to exactly one pixel in a QImage.
+    The image is scaled up with nearest-neighbour interpolation to fill the
+    widget. This keeps paintEvent O(1) regardless of chunk count — only the
+    (cheap) pixel writes in set_chunk_status* grow with chunk count.
+    """
+
+    # ARGB pixel values matching COLORS dict
+    _PIXEL = {
+        "white":  0xFF_DC_DC_DC,
+        "yellow": 0xFF_FF_DC_32,
+        "green":  0xFF_32_C8_32,
+        "red":    0xFF_DC_32_32,
+    }
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.total = 0
-        self.statuses = []  # list of str: "white", "yellow", "green", "red"
+        self.statuses = []          # list of str
+        self._img: QImage | None = None
+        self._img_cols = 0
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(200, 200)
 
-        # Throttled repaint: schedule at most one repaint per interval
+        # Throttled repaint: at most one repaint per interval
         self._repaint_pending = False
         self._repaint_timer = QTimer(self)
         self._repaint_timer.setSingleShot(True)
-        self._repaint_timer.setInterval(50)  # repaint at most every 50ms
+        self._repaint_timer.setInterval(50)  # ms
         self._repaint_timer.timeout.connect(self._do_repaint)
 
+    # ---------------------------------------------------------------- public API
     def set_total(self, total):
         self.total = total
         self.statuses = ["white"] * total
+        self._rebuild_image()
         self._schedule_repaint()
 
     def set_chunk_status(self, index, status):
         if 0 <= index < len(self.statuses):
             self.statuses[index] = status
+            self._set_pixel(index, status)
 
     def set_chunk_status_batch(self, updates):
         """Apply a batch of (index, status) updates and schedule a single repaint."""
         for index, status in updates:
             if 0 <= index < len(self.statuses):
                 self.statuses[index] = status
+                self._set_pixel(index, status)
         self._schedule_repaint()
 
     def clear(self):
         self.total = 0
         self.statuses = []
+        self._img = None
+        self._img_cols = 0
         self._schedule_repaint()
 
+    # ------------------------------------------------------------ image helpers
+    def _rebuild_image(self):
+        """Create a fresh QImage sized to fit all chunks (one pixel each)."""
+        if self.total == 0:
+            self._img = None
+            self._img_cols = 0
+            return
+
+        w = self.width()
+        h = self.height()
+        aspect = w / max(h, 1)
+        cols = max(1, int(math.ceil(math.sqrt(self.total * aspect))))
+        rows = max(1, int(math.ceil(self.total / cols)))
+
+        self._img_cols = cols
+        self._img = QImage(cols, rows, QImage.Format_ARGB32)
+        # Fill entire image with "white" first
+        self._img.fill(self._PIXEL["white"])
+        # Paint existing statuses (for resume)
+        for i, s in enumerate(self.statuses):
+            if s != "white":
+                self._set_pixel(i, s)
+
+    def _set_pixel(self, index, status):
+        if self._img is None or self._img_cols == 0:
+            return
+        col = index % self._img_cols
+        row = index // self._img_cols
+        if row < self._img.height():
+            self._img.setPixel(col, row, self._PIXEL.get(status, self._PIXEL["white"]))
+
+    # ------------------------------------------------------------ repaint logic
     def _schedule_repaint(self):
         if not self._repaint_pending:
             self._repaint_pending = True
@@ -78,51 +133,21 @@ class SectorGridWidget(QWidget):
         self._repaint_pending = False
         self.update()
 
+    def resizeEvent(self, event):
+        """On resize, rebuild the image so the aspect ratio stays correct."""
+        super().resizeEvent(event)
+        if self.total > 0:
+            self._rebuild_image()
+            self.update()
+
     def paintEvent(self, event):
-        if self.total == 0:
+        if self.total == 0 or self._img is None:
             return
 
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False)
-
-        w = self.width()
-        h = self.height()
-
-        # Calculate grid dimensions
-        # We want cols/rows ratio to roughly match widget aspect ratio
-        aspect = w / max(h, 1)
-        cols = max(1, int(math.ceil(math.sqrt(self.total * aspect))))
-        rows = max(1, int(math.ceil(self.total / cols)))
-
-        # Square size (with 1px gap)
-        gap = 1
-        sq_w = max(1, (w - gap) / cols - gap)
-        sq_h = max(1, (h - gap) / rows - gap)
-        sq_size = max(1, min(sq_w, sq_h))
-
-        # Recalculate cols based on actual square size to center the grid
-        actual_cols = max(1, int((w - gap) / (sq_size + gap)))
-        actual_rows = max(1, int(math.ceil(self.total / actual_cols)))
-
-        # Centering offsets
-        total_grid_w = actual_cols * (sq_size + gap) + gap
-        total_grid_h = actual_rows * (sq_size + gap) + gap
-        offset_x = max(0, (w - total_grid_w) / 2)
-        offset_y = max(0, (h - total_grid_h) / 2)
-
-        painter.setPen(QPen(Qt.NoPen))
-
-        for i in range(self.total):
-            col = i % actual_cols
-            row = i // actual_cols
-
-            x = offset_x + gap + col * (sq_size + gap)
-            y = offset_y + gap + row * (sq_size + gap)
-
-            color = COLORS.get(self.statuses[i], COLORS["white"])
-            painter.setBrush(QBrush(color))
-            painter.drawRect(int(x), int(y), int(sq_size), int(sq_size))
-
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        # Scale the tiny pixel-image up to widget size with no interpolation
+        painter.drawImage(self.rect(), self._img)
         painter.end()
 
 class MainWindow(QMainWindow):
