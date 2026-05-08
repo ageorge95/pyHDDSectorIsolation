@@ -1,8 +1,7 @@
 import math
 import os
-
 from PySide6.QtCore import Qt, Slot, QTimer
-from PySide6.QtGui import QColor, QPainter, QBrush, QPen
+from PySide6.QtGui import QColor, QPainter, QBrush, QPen, QIcon
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -17,7 +16,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSizePolicy,
 )
-
 from backend import SectorWorker
 
 COLORS = {
@@ -26,6 +24,12 @@ COLORS = {
     "green": QColor(50, 200, 50),
     "red": QColor(220, 50, 50),
 }
+
+def get_running_path(relative_path):
+    if '_internal' in os.listdir():
+        return os.path.join('_internal', relative_path)
+    else:
+        return relative_path
 
 class SectorGridWidget(QWidget):
     """Custom widget that draws a grid of colored squares representing chunks."""
@@ -125,6 +129,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("HDD Sector Isolator")
+        self.setWindowTitle("HDD Sector Isolator v" + open(get_running_path('version.txt')).read())
+        self.setWindowIcon(QIcon(get_running_path('icon.ico')))
         self.setMinimumSize(700, 500)
         self.resize(900, 650)
 
