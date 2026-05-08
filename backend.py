@@ -20,8 +20,8 @@ class SectorWorker(QThread):
     (truncate) and measures write time. Squares go Yellow -> Green or Red.
     """
 
-    # Signal(int chunk_index, str status)  status: "yellow", "green", "red"
-    chunk_status_changed = Signal(int, str)
+    # Signal(list of (int, str)) — batched chunk updates
+    chunk_status_batch = Signal(list)
     # Signal(int current, int total)
     progress_changed = Signal(int, int)
     # Signal(str message)
@@ -45,6 +45,11 @@ class SectorWorker(QThread):
         # Which phase we are in and where we left off
         self.current_phase = 1  # 1 = allocation, 2 = verification
         self.current_chunk_index = 0  # next chunk to process in current phase
+
+        # Batching
+        self._batch = []
+        self._last_flush_time = 0
+        self._flush_interval = 0.1  # flush UI updates at most every 100ms
 
     # ------------------------------------------------------------------ state
     def save_state(self):
@@ -113,6 +118,20 @@ class SectorWorker(QThread):
         while self._paused and not self._stopped:
             time.sleep(0.1)
 
+    def _queue_status(self, index, status):
+        """Queue a chunk status update and flush if enough time has passed."""
+        self._batch.append((index, status))
+        now = time.monotonic()
+        if now - self._last_flush_time >= self._flush_interval:
+            self._flush_batch()
+
+    def _flush_batch(self):
+        """Emit all queued status updates as a single signal."""
+        if self._batch:
+            self.chunk_status_batch.emit(list(self._batch))
+            self._batch.clear()
+            self._last_flush_time = time.monotonic()
+
     # ------------------------------------------------------------------- run
     def run(self):
         try:
@@ -120,6 +139,7 @@ class SectorWorker(QThread):
         except Exception as e:
             self.log_message.emit(f"Worker error: {e}")
         finally:
+            self._flush_batch()
             self.save_state()
             self.work_finished.emit()
 
@@ -148,9 +168,12 @@ class SectorWorker(QThread):
 
         # Emit existing chunk states (for resume)
         total_work = self.total_chunks * 2  # phase1 + phase2
+        resume_batch = []
         for chunk in self.chunks:
             if chunk["status"] != "white":
-                self.chunk_status_changed.emit(chunk["index"], chunk["status"])
+                resume_batch.append((chunk["index"], chunk["status"]))
+        if resume_batch:
+            self.chunk_status_batch.emit(resume_batch)
 
         # ------------------------------------------------------ Phase 1: Allocation
         if self.current_phase == 1:
@@ -159,6 +182,7 @@ class SectorWorker(QThread):
                 self._wait_if_paused()
                 if self._stopped:
                     self.current_chunk_index = i
+                    self._flush_batch()
                     return
 
                 chunk = self.chunks[i]
@@ -169,12 +193,12 @@ class SectorWorker(QThread):
                         f.seek(self.chunk_size_bytes - 1)
                         f.write(b"\0")
                     chunk["status"] = "yellow"
-                    self.chunk_status_changed.emit(i, "yellow")
+                    self._queue_status(i, "yellow")
                     self.log_message.emit(f"Allocated chunk {i + 1}/{self.total_chunks}")
                 except Exception as e:
                     # If we can't even allocate, mark red immediately
                     chunk["status"] = "red"
-                    self.chunk_status_changed.emit(i, "red")
+                    self._queue_status(i, "red")
                     self.log_message.emit(f"Failed to allocate chunk {i + 1}: {e}")
 
                 completed = i + 1
@@ -186,6 +210,7 @@ class SectorWorker(QThread):
                     self.save_state()
 
             # Phase 1 complete
+            self._flush_batch()
             self.current_phase = 2
             self.current_chunk_index = 0
             self.save_state()
@@ -197,6 +222,7 @@ class SectorWorker(QThread):
                 self._wait_if_paused()
                 if self._stopped:
                     self.current_chunk_index = i
+                    self._flush_batch()
                     return
 
                 chunk = self.chunks[i]
@@ -217,14 +243,14 @@ class SectorWorker(QThread):
 
                     if write_time < self.threshold_s:
                         chunk["status"] = "green"
-                        self.chunk_status_changed.emit(i, "green")
+                        self._queue_status(i, "green")
                         self.log_message.emit(
                             f"GOOD chunk {i + 1}/{self.total_chunks} "
                             f"(write time: {write_time:.3f}s)"
                         )
                     else:
                         chunk["status"] = "red"
-                        self.chunk_status_changed.emit(i, "red")
+                        self._queue_status(i, "red")
                         self.log_message.emit(
                             f"BAD chunk {i + 1}/{self.total_chunks} "
                             f"(write time: {write_time:.3f}s, threshold: {self.threshold_s}s)"
@@ -232,7 +258,7 @@ class SectorWorker(QThread):
                 except Exception as e:
                     # Real write failed — create dummy to hold the space and mark red
                     chunk["status"] = "red"
-                    self.chunk_status_changed.emit(i, "red")
+                    self._queue_status(i, "red")
                     self.log_message.emit(
                         f"FAILED chunk {i + 1}/{self.total_chunks}: {e}"
                     )
@@ -251,6 +277,7 @@ class SectorWorker(QThread):
                     self.current_chunk_index = i + 1
                     self.save_state()
 
+            self._flush_batch()
             self.log_message.emit("Verification complete!")
 
             # Final summary

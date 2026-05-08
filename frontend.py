@@ -1,6 +1,7 @@
 import math
 import os
-from PySide6.QtCore import Qt, Slot
+
+from PySide6.QtCore import Qt, Slot, QTimer
 from PySide6.QtGui import QColor, QPainter, QBrush, QPen
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -36,19 +37,41 @@ class SectorGridWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(200, 200)
 
+        # Throttled repaint: schedule at most one repaint per interval
+        self._repaint_pending = False
+        self._repaint_timer = QTimer(self)
+        self._repaint_timer.setSingleShot(True)
+        self._repaint_timer.setInterval(50)  # repaint at most every 50ms
+        self._repaint_timer.timeout.connect(self._do_repaint)
+
     def set_total(self, total):
         self.total = total
         self.statuses = ["white"] * total
-        self.update()
+        self._schedule_repaint()
 
     def set_chunk_status(self, index, status):
         if 0 <= index < len(self.statuses):
             self.statuses[index] = status
-            self.update()
+
+    def set_chunk_status_batch(self, updates):
+        """Apply a batch of (index, status) updates and schedule a single repaint."""
+        for index, status in updates:
+            if 0 <= index < len(self.statuses):
+                self.statuses[index] = status
+        self._schedule_repaint()
 
     def clear(self):
         self.total = 0
         self.statuses = []
+        self._schedule_repaint()
+
+    def _schedule_repaint(self):
+        if not self._repaint_pending:
+            self._repaint_pending = True
+            self._repaint_timer.start()
+
+    def _do_repaint(self):
+        self._repaint_pending = False
         self.update()
 
     def paintEvent(self, event):
@@ -203,6 +226,7 @@ class MainWindow(QMainWindow):
             self.grid_widget.set_total(state["total_chunks"])
             for chunk in chunks:
                 self.grid_widget.set_chunk_status(chunk["index"], chunk["status"])
+            self.grid_widget._schedule_repaint()
             total_work = state["total_chunks"] * 2
             self.progress_bar.setMaximum(total_work)
             self.progress_bar.setValue(total_work)
@@ -232,6 +256,7 @@ class MainWindow(QMainWindow):
             self.grid_widget.set_total(state["total_chunks"])
             for chunk in state["chunks"]:
                 self.grid_widget.set_chunk_status(chunk["index"], chunk["status"])
+            self.grid_widget._schedule_repaint()
 
             # Restore progress bar
             total_work = state["total_chunks"] * 2
@@ -296,7 +321,7 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _setup_worker_signals(self):
-        self.worker.chunk_status_changed.connect(self._on_chunk_status)
+        self.worker.chunk_status_batch.connect(self._on_chunk_status_batch)
         self.worker.progress_changed.connect(self._on_progress)
         self.worker.log_message.connect(self._on_log)
         self.worker.work_finished.connect(self._on_finished)
@@ -350,14 +375,14 @@ class MainWindow(QMainWindow):
         self._on_settings_changed()
 
     # ----------------------------------------------------------- slots
-    @Slot(int, str)
-    def _on_chunk_status(self, index, status):
+    @Slot(list)
+    def _on_chunk_status_batch(self, updates):
         # Ensure grid total is set (first signal from a fresh worker)
         if self.worker and self.grid_widget.total == 0 and self.worker.total_chunks > 0:
             self.grid_widget.set_total(self.worker.total_chunks)
             self.progress_bar.setMaximum(self.worker.total_chunks * 2)
 
-        self.grid_widget.set_chunk_status(index, status)
+        self.grid_widget.set_chunk_status_batch(updates)
 
     @Slot(int, int)
     def _on_progress(self, current, total):
