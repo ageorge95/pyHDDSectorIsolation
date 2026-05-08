@@ -149,7 +149,10 @@ class SectorWorker(QThread):
         # ------------------------------------------------------ calculate total chunks if fresh start
         if self.total_chunks == 0:
             free = disk_usage(self.disk_path).free
-            self.total_chunks = max(1, int(free // self.chunk_size_bytes))
+            # Reserve one chunk worth of space to avoid running out during allocation
+            # due to filesystem metadata overhead
+            usable = max(0, free - self.chunk_size_bytes)
+            self.total_chunks = max(1, int(usable // self.chunk_size_bytes))
             self.chunks = []
             for i in range(self.total_chunks):
                 self.chunks.append({
@@ -162,7 +165,8 @@ class SectorWorker(QThread):
             self.log_message.emit(
                 f"Calculated {self.total_chunks} chunks "
                 f"({self.chunk_size_bytes / MB:.1f} MB each) "
-                f"for {free / MB:.1f} MB free space"
+                f"for {free / MB:.1f} MB free space "
+                f"(reserving {self.chunk_size_bytes / MB:.1f} MB for filesystem overhead)"
             )
             self.save_state()
 
