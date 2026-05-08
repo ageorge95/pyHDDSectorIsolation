@@ -1,0 +1,6 @@
+/.idea
+*.pyc
+/venv
+/activate.bat
+/build
+/dist
