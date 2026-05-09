@@ -241,8 +241,17 @@ class SectorWorker(QThread):
 
                 try:
                     start = datetime.now()
-                    with open(filepath, "wb") as out:
-                        out.truncate(self.chunk_size_bytes)
+                    # Overwrite the existing file in‑place — never truncate
+                    with open(filepath, "r+b") as f:
+                        # Write in 1 MB blocks to trigger real block allocation
+                        block = b'\x00' * (1024 * 1024)  # 1 MB of zeros
+                        remaining = self.chunk_size_bytes
+                        while remaining > 0:
+                            to_write = min(len(block), remaining)
+                            f.write(block[:to_write])
+                            remaining -= to_write
+                        f.flush()
+                        os.fsync(f.fileno())  # ensure data reaches disk
                     write_time = (datetime.now() - start).total_seconds()
 
                     if write_time < self.threshold_s:
@@ -266,20 +275,16 @@ class SectorWorker(QThread):
                         self.log_message.emit(
                             f"BAD chunk {i + 1}/{self.total_chunks} "
                             f"(write time: {write_time:.3f}s, threshold: {self.threshold_s}s)"
+                            # File remains intact → space stays allocated
                         )
                 except Exception as e:
-                    # Real write failed — create dummy to hold the space and mark red
+                    # Write failed, but the file was never truncated → space is still occupied
                     chunk["status"] = "red"
                     self._queue_status(i, "red")
                     self.log_message.emit(
                         f"FAILED chunk {i + 1}/{self.total_chunks}: {e}"
                     )
-                    try:
-                        with open(filepath, "wb") as f:
-                            f.seek(self.chunk_size_bytes - 1)
-                            f.write(b"\0")
-                    except Exception:
-                        pass
+                    # No need to recreate a dummy; the original file already reserves the space
 
                 completed = self.total_chunks + i + 1
                 self.progress_changed.emit(completed, total_work)
