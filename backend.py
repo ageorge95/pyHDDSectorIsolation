@@ -243,13 +243,8 @@ class SectorWorker(QThread):
                     start = datetime.now()
                     # Overwrite the existing file in‑place — never truncate
                     with open(filepath, "r+b") as f:
-                        # Write in 1 MB blocks to trigger real block allocation
-                        block = b'\x00' * (1024 * 1024)  # 1 MB of zeros
-                        remaining = self.chunk_size_bytes
-                        while remaining > 0:
-                            to_write = min(len(block), remaining)
-                            f.write(block[:to_write])
-                            remaining -= to_write
+                        data = b'\x00' * self.chunk_size_bytes  # one full chunk_size_bytes buffer
+                        f.write(data)
                         f.flush()
                         os.fsync(f.fileno())  # ensure data reaches disk
                     write_time = (datetime.now() - start).total_seconds()
