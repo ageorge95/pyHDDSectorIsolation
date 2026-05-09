@@ -208,11 +208,6 @@ class SectorWorker(QThread):
                 completed = i + 1
                 self.progress_changed.emit(completed, total_work)
 
-                # Save state periodically (every 50 chunks)
-                if (i + 1) % 50 == 0:
-                    self.current_chunk_index = i + 1
-                    self.save_state()
-
             # Phase 1 complete
             self._flush_batch()
             self.current_phase = 2
@@ -283,11 +278,6 @@ class SectorWorker(QThread):
 
                 completed = self.total_chunks + i + 1
                 self.progress_changed.emit(completed, total_work)
-
-                # Save state periodically (every 50 chunks)
-                if (i + 1) % 50 == 0:
-                    self.current_chunk_index = i + 1
-                    self.save_state()
 
             self._flush_batch()
             self.log_message.emit("Verification complete!")
