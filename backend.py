@@ -151,7 +151,7 @@ class SectorWorker(QThread):
             free = disk_usage(self.disk_path).free
             # Reserve one chunk worth of space to avoid running out during allocation
             # due to filesystem metadata overhead
-            usable = max(0, free - self.chunk_size_bytes)
+            usable = free
             self.total_chunks = max(1, int(usable // self.chunk_size_bytes))
             self.chunks = []
             for i in range(self.total_chunks):
