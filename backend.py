@@ -25,7 +25,7 @@ class SectorWorker(QThread):
     # Signal(int current, int total)
     progress_changed = Signal(int, int)
     # Signal(str message)
-    log_message = Signal(str)
+    log_message = Signal(str, str)
     # Signal()
     work_finished = Signal()
 
@@ -65,9 +65,9 @@ class SectorWorker(QThread):
         try:
             with open(SESSION_FILE, "w") as f:
                 json.dump(state, f, indent=2)
-            self.log_message.emit(f"Session state saved ({len(self.chunks)} chunks)")
+            self.log_message.emit('info', f"Session state saved ({len(self.chunks)} chunks)")
         except Exception as e:
-            self.log_message.emit(f"Failed to save session state: {e}")
+            self.log_message.emit('error', f"Failed to save session state: {e}")
 
     @staticmethod
     def load_state():
@@ -137,7 +137,7 @@ class SectorWorker(QThread):
         try:
             self._run_internal()
         except Exception as e:
-            self.log_message.emit(f"Worker error: {e}")
+            self.log_message.emit('error', f"Worker error: {e}")
         finally:
             self._flush_batch()
             self.save_state()
@@ -162,7 +162,7 @@ class SectorWorker(QThread):
                 })
             self.current_phase = 1
             self.current_chunk_index = 0
-            self.log_message.emit(
+            self.log_message.emit('info',
                 f"Calculated {self.total_chunks} chunks "
                 f"({self.chunk_size_bytes / MB:.1f} MB each) "
                 f"for {free / MB:.1f} MB free space "
@@ -181,7 +181,7 @@ class SectorWorker(QThread):
 
         # ------------------------------------------------------ Phase 1: Allocation
         if self.current_phase == 1:
-            self.log_message.emit("Phase 1: Allocating dummy files...")
+            self.log_message.emit('info', "Phase 1: Allocating dummy files...")
             for i in range(self.current_chunk_index, self.total_chunks):
                 self._wait_if_paused()
                 if self._stopped:
@@ -198,12 +198,12 @@ class SectorWorker(QThread):
                         f.write(b"\0")
                     chunk["status"] = "yellow"
                     self._queue_status(i, "yellow")
-                    self.log_message.emit(f"Allocated chunk {i + 1}/{self.total_chunks}")
+                    self.log_message.emit('info', f"Allocated chunk {i + 1}/{self.total_chunks}")
                 except Exception as e:
                     # If we can't even allocate, mark red immediately
                     chunk["status"] = "red"
                     self._queue_status(i, "red")
-                    self.log_message.emit(f"Failed to allocate chunk {i + 1}: {e}")
+                    self.log_message.emit('warning', f"Failed to allocate chunk {i + 1}: {e}")
 
                 completed = i + 1
                 self.progress_changed.emit(completed, total_work)
@@ -216,7 +216,7 @@ class SectorWorker(QThread):
 
         # ------------------------------------------------------ Phase 2: Verification
         if self.current_phase == 2:
-            self.log_message.emit("Phase 2: Verifying sectors with real writes...")
+            self.log_message.emit('info', "Phase 2: Verifying sectors with real writes...")
             for i in range(self.current_chunk_index, self.total_chunks):
                 self._wait_if_paused()
                 if self._stopped:
@@ -254,15 +254,15 @@ class SectorWorker(QThread):
                             os.rename(filepath, new_filepath)
                             chunk["filename"] = new_filename
                         except Exception as rename_err:
-                            self.log_message.emit(f"Could not rename chunk {i + 1}: {rename_err}")
-                        self.log_message.emit(
+                            self.log_message.emit('error', f"Could not rename chunk {i + 1}: {rename_err}")
+                        self.log_message.emit('info',
                             f"GOOD chunk {i + 1}/{self.total_chunks} "
                             f"(write time: {write_time:.3f}s)"
                         )
                     else:
                         chunk["status"] = "red"
                         self._queue_status(i, "red")
-                        self.log_message.emit(
+                        self.log_message.emit('info',
                             f"BAD chunk {i + 1}/{self.total_chunks} "
                             f"(write time: {write_time:.3f}s, threshold: {self.threshold_s}s)"
                             # File remains intact → space stays allocated
@@ -271,7 +271,7 @@ class SectorWorker(QThread):
                     # Write failed, but the file was never truncated → space is still occupied
                     chunk["status"] = "red"
                     self._queue_status(i, "red")
-                    self.log_message.emit(
+                    self.log_message.emit('warning',
                         f"FAILED chunk {i + 1}/{self.total_chunks}: {e}"
                     )
                     # No need to recreate a dummy; the original file already reserves the space
@@ -280,23 +280,23 @@ class SectorWorker(QThread):
                 self.progress_changed.emit(completed, total_work)
 
             self._flush_batch()
-            self.log_message.emit("Verification complete!")
+            self.log_message.emit('info', "Verification complete!")
 
             # Final summary
             good = sum(1 for c in self.chunks if c["status"] == "green")
             bad = sum(1 for c in self.chunks if c["status"] == "red")
-            self.log_message.emit(f"Summary: {good} GOOD, {bad} BAD out of {self.total_chunks}")
+            self.log_message.emit('info', f"Summary: {good} GOOD, {bad} BAD out of {self.total_chunks}")
 
     # --------------------------------------------------------------- controls
     def pause(self):
         self._paused = True
-        self.log_message.emit("Paused")
+        self.log_message.emit('info', "Paused")
 
     def resume(self):
         self._paused = False
-        self.log_message.emit("Resumed")
+        self.log_message.emit('info', "Resumed")
 
     def stop(self):
         self._stopped = True
         self._paused = False
-        self.log_message.emit("Stopping...")
+        self.log_message.emit('info', "Stopping...")

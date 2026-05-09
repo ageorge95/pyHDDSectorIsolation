@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 from backend import SectorWorker
+from logging import getLogger
 
 COLORS = {
     "white": QColor(220, 220, 220),
@@ -153,6 +154,9 @@ class SectorGridWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+
+        self._log = getLogger()
+
         self.setWindowTitle("HDD Sector Isolator")
         self.setWindowTitle("HDD Sector Isolator v" + open(get_running_path('version.txt')).read())
         self.setWindowIcon(QIcon(get_running_path('icon.ico')))
@@ -422,8 +426,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(current)
 
     @Slot(str)
-    def _on_log(self, message):
-        print(message)
+    def _on_log(self,
+                level, message):
+        getattr(self._log, level)(message)
 
     @Slot()
     def _on_finished(self):

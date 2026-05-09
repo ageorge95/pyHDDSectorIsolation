@@ -1,1 +1,2 @@
 PySide6
+ag95[LoggingScripts] @ git+https://github.com/ageorge95/ag95.git
