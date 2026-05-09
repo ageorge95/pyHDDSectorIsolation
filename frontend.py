@@ -21,7 +21,6 @@ from logging import getLogger
 
 COLORS = {
     "white": QColor(220, 220, 220),
-    "yellow": QColor(255, 220, 50),
     "green": QColor(50, 200, 50),
     "red": QColor(220, 50, 50),
 }
@@ -45,7 +44,6 @@ class SectorGridWidget(QWidget):
     # ARGB pixel values matching COLORS dict
     _PIXEL = {
         "white":  0xFF_DC_DC_DC,
-        "yellow": 0xFF_FF_DC_32,
         "green":  0xFF_32_C8_32,
         "red":    0xFF_DC_32_32,
     }
@@ -262,7 +260,7 @@ class MainWindow(QMainWindow):
             for chunk in chunks:
                 self.grid_widget.set_chunk_status(chunk["index"], chunk["status"])
             self.grid_widget._schedule_repaint()
-            total_work = state["total_chunks"] * 2
+            total_work = state["total_chunks"]
             self.progress_bar.setMaximum(total_work)
             self.progress_bar.setValue(total_work)
             print(f"Loaded completed session ({len(chunks)} chunks). Click 'New Session' to start fresh.")
@@ -274,7 +272,8 @@ class MainWindow(QMainWindow):
             f"A previous session was found:\n"
             f"  Path: {state['disk_path']}\n"
             f"  Chunks: {state['total_chunks']} × {state['chunk_size_mb']:.1f} MB\n"
-            f"  Phase: {state['current_phase']}, at chunk {state['current_chunk_index']}\n\n"
+            f"  Progress: {len([c for c in chunks if c['status'] != 'white'])} of {state['total_chunks']} chunks processed\n"
+            f"  Next chunk: {state['current_chunk_index']}\n\n"
             f"Do you want to resume?",
             QMessageBox.Yes | QMessageBox.No,
         )
@@ -294,13 +293,10 @@ class MainWindow(QMainWindow):
             self.grid_widget._schedule_repaint()
 
             # Restore progress bar
-            total_work = state["total_chunks"] * 2
+            total_work = state["total_chunks"]
             self.progress_bar.setMaximum(total_work)
             # Calculate completed work
-            if state["current_phase"] == 1:
-                completed = state["current_chunk_index"]
-            else:
-                completed = state["total_chunks"] + state["current_chunk_index"]
+            completed = state["current_chunk_index"]
             self.progress_bar.setValue(completed)
 
             self._set_running_state(True)
@@ -327,7 +323,7 @@ class MainWindow(QMainWindow):
             chunk_bytes = int(self.chunk_spin.value() * 1024 * 1024)
             total = max(1, int(free // chunk_bytes))
             self.grid_widget.set_total(total)
-            self.progress_bar.setMaximum(total * 2)
+            self.progress_bar.setMaximum(total)
             self.progress_bar.setValue(0)
         except Exception:
             self.grid_widget.clear()
@@ -415,7 +411,7 @@ class MainWindow(QMainWindow):
         # Ensure grid total is set (first signal from a fresh worker)
         if self.worker and self.grid_widget.total == 0 and self.worker.total_chunks > 0:
             self.grid_widget.set_total(self.worker.total_chunks)
-            self.progress_bar.setMaximum(self.worker.total_chunks * 2)
+            self.progress_bar.setMaximum(self.worker.total_chunks)
 
         self.grid_widget.set_chunk_status_batch(updates)
 

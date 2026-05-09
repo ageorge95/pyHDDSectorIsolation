@@ -11,20 +11,17 @@ MB = 1024 * 1024
 
 class SectorWorker(QThread):
     """
-    Two-phase sector isolation worker.
+    Single‑phase sector isolation worker.
 
-    Phase 1 (allocation): Creates dummy files (seek + single byte) to reserve
-    all available disk space. Squares go White -> Yellow.
-
-    Phase 2 (verification): Overwrites each dummy file with a real write
-    (truncate) and measures write time. Squares go Yellow -> Green or Red.
+    Writes full‑size dummy files while measuring write time.
+    Squares go White -> Green (fast) or Red (slow / fail).
     """
 
     # Signal(list of (int, str)) — batched chunk updates
     chunk_status_batch = Signal(list)
     # Signal(int current, int total)
     progress_changed = Signal(int, int)
-    # Signal(str message)
+    # Signal(str level, str message)
     log_message = Signal(str, str)
     # Signal()
     work_finished = Signal()
@@ -36,15 +33,13 @@ class SectorWorker(QThread):
         self.threshold_s = threshold_s
 
         self.total_chunks = 0
-        # Each entry: {"index": int, "status": "white"|"yellow"|"green"|"red", "filename": str}
+        # Each entry: {"index": int, "status": "white"|"green"|"red", "filename": str}
         self.chunks = []
 
         self._paused = False
         self._stopped = False
 
-        # Which phase we are in and where we left off
-        self.current_phase = 1  # 1 = allocation, 2 = verification
-        self.current_chunk_index = 0  # next chunk to process in current phase
+        self.current_chunk_index = 0  # next chunk to process
 
         # Batching
         self._batch = []
@@ -58,7 +53,6 @@ class SectorWorker(QThread):
             "chunk_size_mb": self.chunk_size_bytes / MB,
             "threshold_s": self.threshold_s,
             "total_chunks": self.total_chunks,
-            "current_phase": self.current_phase,
             "current_chunk_index": self.current_chunk_index,
             "chunks": self.chunks,
         }
@@ -96,7 +90,6 @@ class SectorWorker(QThread):
         )
         worker.total_chunks = state["total_chunks"]
         worker.chunks = state["chunks"]
-        worker.current_phase = state["current_phase"]
         worker.current_chunk_index = state["current_chunk_index"]
         return worker
 
@@ -146,12 +139,11 @@ class SectorWorker(QThread):
     def _run_internal(self):
         sectors_dir = self._sectors_dir()
 
-        # ------------------------------------------------------ calculate total chunks if fresh start
+        # ----- calculate total chunks if fresh start (with 0.5 % safety margin)
         if self.total_chunks == 0:
             free = disk_usage(self.disk_path).free
-            # Reserve one chunk worth of space to avoid running out during allocation
-            # due to filesystem metadata overhead
-            usable = free
+            # Reserve a small amount for filesystem metadata to avoid ENOSPC
+            usable = int(free * 0.995)
             self.total_chunks = max(1, int(usable // self.chunk_size_bytes))
             self.chunks = []
             for i in range(self.total_chunks):
@@ -160,18 +152,16 @@ class SectorWorker(QThread):
                     "status": "white",
                     "filename": f"{self._padded_name(i + 1)}.dat",
                 })
-            self.current_phase = 1
             self.current_chunk_index = 0
             self.log_message.emit('info',
                 f"Calculated {self.total_chunks} chunks "
                 f"({self.chunk_size_bytes / MB:.1f} MB each) "
-                f"for {free / MB:.1f} MB free space "
-                f"(reserving {self.chunk_size_bytes / MB:.1f} MB for filesystem overhead)"
+                f"from {free / MB:.1f} MB free space "
+                f"(0.5 % reserved for metadata overhead)"
             )
             self.save_state()
 
         # Emit existing chunk states (for resume)
-        total_work = self.total_chunks * 2  # phase1 + phase2
         resume_batch = []
         for chunk in self.chunks:
             if chunk["status"] != "white":
@@ -179,113 +169,80 @@ class SectorWorker(QThread):
         if resume_batch:
             self.chunk_status_batch.emit(resume_batch)
 
-        # ------------------------------------------------------ Phase 1: Allocation
-        if self.current_phase == 1:
-            self.log_message.emit('info', "Phase 1: Allocating dummy files...")
-            for i in range(self.current_chunk_index, self.total_chunks):
-                self._wait_if_paused()
-                if self._stopped:
-                    self.current_chunk_index = i
-                    self._flush_batch()
-                    return
+        # --------------------------------------------------- Single‑phase: write & time
+        self.log_message.emit('info', "Writing and verifying chunks...")
+        total_work = self.total_chunks
 
-                chunk = self.chunks[i]
-                filepath = self._chunk_filepath(chunk)
+        for i in range(self.current_chunk_index, self.total_chunks):
+            self._wait_if_paused()
+            if self._stopped:
+                self.current_chunk_index = i
+                self._flush_batch()
+                return
 
-                try:
-                    with open(filepath, "wb") as f:
-                        f.seek(self.chunk_size_bytes - 1)
-                        f.write(b"\0")
-                    chunk["status"] = "yellow"
-                    self._queue_status(i, "yellow")
-                    self.log_message.emit('info', f"Allocated chunk {i + 1}/{self.total_chunks}")
-                except Exception as e:
-                    # If we can't even allocate, mark red immediately
-                    chunk["status"] = "red"
-                    self._queue_status(i, "red")
-                    self.log_message.emit('warning', f"Failed to allocate chunk {i + 1}: {e}")
+            chunk = self.chunks[i]
 
-                completed = i + 1
-                self.progress_changed.emit(completed, total_work)
+            # Skip chunks already done (green or red from a previous run)
+            if chunk["status"] in ("green", "red"):
+                self.progress_changed.emit(i + 1, total_work)
+                continue
 
-            # Phase 1 complete
-            self._flush_batch()
-            self.current_phase = 2
-            self.current_chunk_index = 0
-            self.save_state()
+            filepath = self._chunk_filepath(chunk)
 
-        # ------------------------------------------------------ Phase 2: Verification
-        if self.current_phase == 2:
-            self.log_message.emit('info', "Phase 2: Verifying sectors with real writes...")
-            for i in range(self.current_chunk_index, self.total_chunks):
-                self._wait_if_paused()
-                if self._stopped:
-                    self.current_chunk_index = i
-                    self._flush_batch()
-                    return
+            try:
+                # Write the full chunk in 1 MB blocks, measure total time
+                start = datetime.now()
+                with open(filepath, "wb") as f:
+                    block_size = 1024 * 1024  # 1 MB
+                    buf = b'\x00' * block_size
+                    remaining = self.chunk_size_bytes
+                    while remaining > 0:
+                        to_write = min(block_size, remaining)
+                        f.write(buf[:to_write])
+                        remaining -= to_write
+                    f.flush()
+                    os.fsync(f.fileno())
+                write_time = (datetime.now() - start).total_seconds()
 
-                chunk = self.chunks[i]
-
-                # Skip chunks that already failed allocation
-                if chunk["status"] == "red":
-                    completed = self.total_chunks + i + 1
-                    self.progress_changed.emit(completed, total_work)
-                    continue
-
-                filepath = self._chunk_filepath(chunk)
-
-                try:
-                    start = datetime.now()
-                    # Overwrite the existing file in‑place — never truncate
-                    with open(filepath, "r+b") as f:
-                        data = b'\x00' * self.chunk_size_bytes  # one full chunk_size_bytes buffer
-                        f.write(data)
-                        f.flush()
-                        os.fsync(f.fileno())  # ensure data reaches disk
-                    write_time = (datetime.now() - start).total_seconds()
-
-                    if write_time < self.threshold_s:
-                        chunk["status"] = "green"
-                        self._queue_status(i, "green")
-                        # Rename file to GOOD_ prefix
-                        new_filename = f"GOOD_{chunk['filename']}"
-                        new_filepath = os.path.join(self._sectors_dir(), new_filename)
-                        try:
-                            os.rename(filepath, new_filepath)
-                            chunk["filename"] = new_filename
-                        except Exception as rename_err:
-                            self.log_message.emit('error', f"Could not rename chunk {i + 1}: {rename_err}")
-                        self.log_message.emit('info',
-                            f"GOOD chunk {i + 1}/{self.total_chunks} "
-                            f"(write time: {write_time:.3f}s)"
-                        )
-                    else:
-                        chunk["status"] = "red"
-                        self._queue_status(i, "red")
-                        self.log_message.emit('info',
-                            f"BAD chunk {i + 1}/{self.total_chunks} "
-                            f"(write time: {write_time:.3f}s, threshold: {self.threshold_s}s)"
-                            # File remains intact → space stays allocated
-                        )
-                except Exception as e:
-                    # Write failed, but the file was never truncated → space is still occupied
-                    chunk["status"] = "red"
-                    self._queue_status(i, "red")
-                    self.log_message.emit('warning',
-                        f"FAILED chunk {i + 1}/{self.total_chunks}: {e}"
+                if write_time < self.threshold_s:
+                    chunk["status"] = "green"
+                    self._queue_status(i, "green")
+                    # Rename to GOOD_ prefix
+                    new_filename = f"GOOD_{chunk['filename']}"
+                    new_filepath = os.path.join(self._sectors_dir(), new_filename)
+                    try:
+                        os.rename(filepath, new_filepath)
+                        chunk["filename"] = new_filename
+                    except Exception as rename_err:
+                        self.log_message.emit('error', f"Could not rename chunk {i + 1}: {rename_err}")
+                    self.log_message.emit('info',
+                        f"GOOD chunk {i + 1}/{self.total_chunks} "
+                        f"(write time: {write_time:.3f}s)"
                     )
-                    # No need to recreate a dummy; the original file already reserves the space
+                else:
+                    chunk["status"] = "red"
+                    self._queue_status(i, "red")
+                    self.log_message.emit('info',
+                        f"BAD chunk {i + 1}/{self.total_chunks} "
+                        f"(write time: {write_time:.3f}s, threshold: {self.threshold_s}s)"
+                    )
+            except Exception as e:
+                # Write failed – mark red, log, and continue
+                chunk["status"] = "red"
+                self._queue_status(i, "red")
+                self.log_message.emit('warning',
+                    f"FAILED chunk {i + 1}/{self.total_chunks}: {e}"
+                )
 
-                completed = self.total_chunks + i + 1
-                self.progress_changed.emit(completed, total_work)
+            self.progress_changed.emit(i + 1, total_work)
 
-            self._flush_batch()
-            self.log_message.emit('info', "Verification complete!")
+        self._flush_batch()
+        self.log_message.emit('info', "Verification complete!")
 
-            # Final summary
-            good = sum(1 for c in self.chunks if c["status"] == "green")
-            bad = sum(1 for c in self.chunks if c["status"] == "red")
-            self.log_message.emit('info', f"Summary: {good} GOOD, {bad} BAD out of {self.total_chunks}")
+        # Final summary
+        good = sum(1 for c in self.chunks if c["status"] == "green")
+        bad = sum(1 for c in self.chunks if c["status"] == "red")
+        self.log_message.emit('info', f"Summary: {good} GOOD, {bad} BAD out of {self.total_chunks}")
 
     # --------------------------------------------------------------- controls
     def pause(self):
