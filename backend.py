@@ -46,6 +46,9 @@ class SectorWorker(QThread):
         self._last_flush_time = 0
         self._flush_interval = 0.1  # flush UI updates at most every 100ms
 
+        self._max_write_attempts = 3
+        self._retry_delay = 0.5  # seconds between retries, lets USB cache flush
+
     # ------------------------------------------------------------------ state
     def save_state(self):
         state = {
@@ -189,50 +192,73 @@ class SectorWorker(QThread):
 
             filepath = self._chunk_filepath(chunk)
 
-            try:
-                # Write the full chunk in 1 MB blocks, measure total time
-                start = datetime.now()
-                with open(filepath, "wb") as f:
-                    block_size = 1024 * 1024  # 1 MB
-                    buf = b'\x00' * block_size
-                    remaining = self.chunk_size_bytes
-                    while remaining > 0:
-                        to_write = min(block_size, remaining)
-                        f.write(buf[:to_write])
-                        remaining -= to_write
-                    f.flush()
-                    os.fsync(f.fileno())
-                write_time = (datetime.now() - start).total_seconds()
+            passed = False
+            for attempt in range(self._max_write_attempts):
+                try:
+                    start = datetime.now()
+                    with open(filepath, "wb") as f:
+                        block_size = 1024 * 1024  # 1 MB
+                        buf = b'\x00' * block_size
+                        remaining = self.chunk_size_bytes
+                        while remaining > 0:
+                            to_write = min(block_size, remaining)
+                            f.write(buf[:to_write])
+                            remaining -= to_write
+                        f.flush()
+                        os.fsync(f.fileno())
+                    write_time = (datetime.now() - start).total_seconds()
 
-                if write_time < self.threshold_s:
-                    chunk["status"] = "green"
-                    self._queue_status(i, "green")
-                    # Rename to GOOD_ prefix
-                    new_filename = f"GOOD_{chunk['filename']}"
-                    new_filepath = os.path.join(self._sectors_dir(), new_filename)
-                    try:
-                        os.rename(filepath, new_filepath)
-                        chunk["filename"] = new_filename
-                    except Exception as rename_err:
-                        self.log_message.emit('error', f"Could not rename chunk {i + 1}: {rename_err}")
-                    self.log_message.emit('info',
-                        f"GOOD chunk {i + 1}/{self.total_chunks} "
-                        f"(write time: {write_time:.3f}s)"
-                    )
-                else:
-                    chunk["status"] = "red"
-                    self._queue_status(i, "red")
-                    self.log_message.emit('info',
-                        f"BAD chunk {i + 1}/{self.total_chunks} "
-                        f"(write time: {write_time:.3f}s, threshold: {self.threshold_s}s)"
-                    )
-            except Exception as e:
-                # Write failed – mark red, log, and continue
-                chunk["status"] = "red"
-                self._queue_status(i, "red")
-                self.log_message.emit('warning',
-                    f"FAILED chunk {i + 1}/{self.total_chunks}: {e}"
-                )
+                    if write_time < self.threshold_s:
+                        chunk["status"] = "green"
+                        self._queue_status(i, "green")
+                        new_filename = f"GOOD_{chunk['filename']}"
+                        new_filepath = os.path.join(self._sectors_dir(), new_filename)
+                        try:
+                            os.rename(filepath, new_filepath)
+                            chunk["filename"] = new_filename
+                        except Exception as rename_err:
+                            self.log_message.emit('error', f"Could not rename chunk {i + 1}: {rename_err}")
+                        self.log_message.emit('info',
+                            f"GOOD chunk {i + 1}/{self.total_chunks} "
+                            f"(write time: {write_time:.3f}s)"
+                        )
+                        passed = True
+                        break
+
+                    if attempt < self._max_write_attempts - 1:
+                        os.remove(filepath)
+                        time.sleep(self._retry_delay)
+                        self.log_message.emit('info',
+                            f"Retrying chunk {i + 1}/{self.total_chunks} "
+                            f"(attempt {attempt + 1} was {write_time:.3f}s, threshold: {self.threshold_s}s)"
+                        )
+                    else:
+                        chunk["status"] = "red"
+                        self._queue_status(i, "red")
+                        self.log_message.emit('info',
+                            f"BAD chunk {i + 1}/{self.total_chunks} "
+                            f"(write time: {write_time:.3f}s, threshold: {self.threshold_s}s, "
+                            f"all {self._max_write_attempts} attempts exceeded threshold)"
+                        )
+
+                except Exception as e:
+                    if attempt < self._max_write_attempts - 1:
+                        if os.path.exists(filepath):
+                            try:
+                                os.remove(filepath)
+                            except Exception:
+                                pass
+                        time.sleep(self._retry_delay)
+                        self.log_message.emit('info',
+                            f"Retrying chunk {i + 1}/{self.total_chunks} "
+                            f"(attempt {attempt + 1} failed: {e})"
+                        )
+                    else:
+                        chunk["status"] = "red"
+                        self._queue_status(i, "red")
+                        self.log_message.emit('warning',
+                            f"FAILED chunk {i + 1}/{self.total_chunks}: {e}"
+                        )
 
             self.progress_changed.emit(i + 1, total_work)
 
