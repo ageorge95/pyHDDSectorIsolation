@@ -123,7 +123,8 @@ class SectorWorker(QThread):
             win32con.FILE_FLAG_WRITE_THROUGH,
             None,
         )
-        fd = msvcrt.open_osfhandle(handle, os.O_BINARY)
+        raw_handle = handle.Detach()
+        fd = msvcrt.open_osfhandle(raw_handle, os.O_BINARY)
         return os.fdopen(fd, "wb", 1024 * 1024)  # 1 MB buffer
 
     def _wait_if_paused(self):
