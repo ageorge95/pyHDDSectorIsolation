@@ -15,7 +15,10 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QMessageBox,
     QSizePolicy,
+    QPlainTextEdit,
+    QSplitter,
 )
+from PySide6.QtCore import Qt
 from backend import SectorWorker
 from logging import getLogger
 
@@ -158,8 +161,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("HDD Sector Isolator")
         self.setWindowTitle("HDD Sector Isolator v" + open(get_running_path('version.txt')).read())
         self.setWindowIcon(QIcon(get_running_path('icon.ico')))
-        self.setMinimumSize(700, 500)
-        self.resize(900, 650)
+        self.setMinimumSize(700, 650)
+        self.resize(900, 800)
 
         self.worker = None
         self._is_paused = False
@@ -238,9 +241,33 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         main_layout.addWidget(self.progress_bar)
 
-        # -------------------------------------------- Sector grid
+        # -------------------------------------------- Splitter: grid + console
+        splitter = QSplitter(Qt.Vertical)
+
         self.grid_widget = SectorGridWidget()
-        main_layout.addWidget(self.grid_widget, stretch=1)
+        splitter.addWidget(self.grid_widget)
+
+        console_widget = QWidget()
+        console_layout = QVBoxLayout(console_widget)
+        console_layout.setContentsMargins(0, 0, 0, 0)
+
+        console_header = QHBoxLayout()
+        console_header.addWidget(QLabel("Console"))
+        console_header.addStretch()
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self._on_clear_console)
+        console_header.addWidget(clear_btn)
+        console_layout.addLayout(console_header)
+
+        self.console = QPlainTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setMaximumBlockCount(5000)
+        console_layout.addWidget(self.console)
+
+        splitter.addWidget(console_widget)
+        splitter.setStretchFactor(0, 3)   # grid gets 3/4
+        splitter.setStretchFactor(1, 1)   # console gets 1/4
+        main_layout.addWidget(splitter, stretch=1)
 
     # ----------------------------------------------------------- session load
     def _try_load_session(self):
@@ -328,6 +355,9 @@ class MainWindow(QMainWindow):
         except Exception:
             self.grid_widget.clear()
 
+    def _on_clear_console(self):
+        self.console.clear()
+
     # ----------------------------------------------------------- browse
     def _browse(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Target Folder")
@@ -399,6 +429,7 @@ class MainWindow(QMainWindow):
 
         self._set_running_state(False)
         self.grid_widget.clear()
+        self.console.clear()
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(100)
 
@@ -421,10 +452,10 @@ class MainWindow(QMainWindow):
             self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(current)
 
-    @Slot(str)
-    def _on_log(self,
-                level, message):
+    @Slot(str, str)
+    def _on_log(self, level, message):
         getattr(self._log, level)(message)
+        self.console.appendPlainText(message)
 
     @Slot()
     def _on_finished(self):
