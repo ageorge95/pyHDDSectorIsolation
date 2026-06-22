@@ -1,6 +1,8 @@
 import json
 import os
 import time
+import win32file
+import win32con
 from datetime import datetime
 from shutil import disk_usage
 from PySide6.QtCore import QThread, Signal
@@ -110,6 +112,20 @@ class SectorWorker(QThread):
     def _padded_name(index):
         return str(index).rjust(20, "0")
 
+    def _open_write_through(self, filepath):
+        import msvcrt
+        handle = win32file.CreateFile(
+            filepath,
+            win32con.GENERIC_WRITE,
+            0,
+            None,
+            win32con.CREATE_ALWAYS,
+            win32con.FILE_FLAG_WRITE_THROUGH,
+            None,
+        )
+        fd = msvcrt.open_osfhandle(handle, os.O_BINARY)
+        return os.fdopen(fd, "wb", 1024 * 1024)  # 1 MB buffer
+
     def _wait_if_paused(self):
         while self._paused and not self._stopped:
             time.sleep(0.1)
@@ -194,21 +210,30 @@ class SectorWorker(QThread):
 
             passed = False
             for attempt in range(self._max_write_attempts):
+                f = None
                 try:
-                    start = datetime.now()
-                    with open(filepath, "wb") as f:
-                        block_size = 1024 * 1024  # 1 MB
-                        buf = b'\x00' * block_size
-                        remaining = self.chunk_size_bytes
-                        while remaining > 0:
-                            to_write = min(block_size, remaining)
-                            f.write(buf[:to_write])
-                            remaining -= to_write
-                        f.flush()
-                        os.fsync(f.fileno())
-                    write_time = (datetime.now() - start).total_seconds()
+                    f = self._open_write_through(filepath)
+                    block_size = 1024 * 1024  # 1 MB
+                    buf = b'\x00' * block_size
 
-                    if write_time < self.threshold_s:
+                    # Phase 1: buffered write — data leaves Python, hits storage driver
+                    write_start = datetime.now()
+                    remaining = self.chunk_size_bytes
+                    while remaining > 0:
+                        to_write = min(block_size, remaining)
+                        f.write(buf[:to_write])
+                        remaining -= to_write
+                    f.flush()
+                    write_time = (datetime.now() - write_start).total_seconds()
+
+                    # Phase 2: force to device — wait for platters
+                    sync_start = datetime.now()
+                    os.fsync(f.fileno())
+                    sync_time = (datetime.now() - sync_start).total_seconds()
+
+                    total_time = write_time + sync_time
+
+                    if total_time < self.threshold_s:
                         chunk["status"] = "green"
                         self._queue_status(i, "green")
                         new_filename = f"GOOD_{chunk['filename']}"
@@ -220,7 +245,7 @@ class SectorWorker(QThread):
                             self.log_message.emit('error', f"Could not rename chunk {i + 1}: {rename_err}")
                         self.log_message.emit('info',
                             f"GOOD chunk {i + 1}/{self.total_chunks} "
-                            f"(write time: {write_time:.3f}s)"
+                            f"(write: {write_time:.3f}s  sync: {sync_time:.3f}s  total: {total_time:.3f}s)"
                         )
                         passed = True
                         break
@@ -230,14 +255,16 @@ class SectorWorker(QThread):
                         time.sleep(self._retry_delay)
                         self.log_message.emit('info',
                             f"Retrying chunk {i + 1}/{self.total_chunks} "
-                            f"(attempt {attempt + 1} was {write_time:.3f}s, threshold: {self.threshold_s}s)"
+                            f"(attempt {attempt + 1}: write: {write_time:.3f}s  sync: {sync_time:.3f}s  "
+                            f"total: {total_time:.3f}s, threshold: {self.threshold_s}s)"
                         )
                     else:
                         chunk["status"] = "red"
                         self._queue_status(i, "red")
                         self.log_message.emit('info',
                             f"BAD chunk {i + 1}/{self.total_chunks} "
-                            f"(write time: {write_time:.3f}s, threshold: {self.threshold_s}s, "
+                            f"(write: {write_time:.3f}s  sync: {sync_time:.3f}s  total: {total_time:.3f}s, "
+                            f"threshold: {self.threshold_s}s, "
                             f"all {self._max_write_attempts} attempts exceeded threshold)"
                         )
 
@@ -259,6 +286,12 @@ class SectorWorker(QThread):
                         self.log_message.emit('warning',
                             f"FAILED chunk {i + 1}/{self.total_chunks}: {e}"
                         )
+                finally:
+                    if f is not None:
+                        try:
+                            f.close()
+                        except Exception:
+                            pass
 
             self.progress_changed.emit(i + 1, total_work)
 
