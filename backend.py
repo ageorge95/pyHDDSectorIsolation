@@ -48,8 +48,8 @@ class SectorWorker(QThread):
         self._last_flush_time = 0
         self._flush_interval = 0.1  # flush UI updates at most every 100ms
 
-        self._max_write_attempts = 3
-        self._retry_delay = 0.5  # seconds between retries, lets USB cache flush
+        self._max_write_attempts = 2
+        self._retry_delay = 2  # seconds between retries, lets USB cache flush
 
     # ------------------------------------------------------------------ state
     def save_state(self):
