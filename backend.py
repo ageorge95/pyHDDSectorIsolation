@@ -211,7 +211,6 @@ class SectorWorker(QThread):
 
             passed = False
             for attempt in range(self._max_write_attempts):
-                f = None
                 try:
                     f = self._open_write_through(filepath)
                     block_size = 1024 * 1024  # 1 MB
@@ -231,6 +230,8 @@ class SectorWorker(QThread):
                     sync_start = datetime.now()
                     os.fsync(f.fileno())
                     sync_time = (datetime.now() - sync_start).total_seconds()
+                    f.close()
+                    f = None
 
                     total_time = write_time + sync_time
 
