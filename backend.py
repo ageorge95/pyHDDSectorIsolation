@@ -179,6 +179,36 @@ class SectorWorker(QThread):
         except Exception:
             pass
 
+    def _allocate_file_space(self, filepath, size_bytes):
+        """
+        Ensure *filepath* occupies exactly *size_bytes* on disk.
+
+        Uses SetFilePointerEx + SetEndOfFile — NTFS allocates the clusters
+        in the MFT without physically writing data to them.  Reading the
+        file returns zeros but the platters are never touched.
+        If the file already exists it is extended in-place; otherwise it
+        is created fresh (without WRITE_THROUGH).
+        """
+        if os.path.exists(filepath):
+            disposition = win32con.OPEN_EXISTING
+        else:
+            disposition = win32con.CREATE_ALWAYS
+
+        handle = win32file.CreateFile(
+            filepath,
+            win32con.GENERIC_WRITE,
+            0,
+            None,
+            disposition,
+            0,  # no WRITE_THROUGH — filesystem metadata only
+            None,
+        )
+        h_int = int(handle)
+        handle.Detach()
+        ctypes.windll.kernel32.SetFilePointerEx(h_int, size_bytes, None, 0)
+        ctypes.windll.kernel32.SetEndOfFile(h_int)
+        ctypes.windll.kernel32.CloseHandle(h_int)
+
     def _wait_for_drive_ready(self, sectors_dir):
         """
         Block until the drive responds to a tiny probe write, or *max_recovery_wait*
@@ -369,6 +399,10 @@ class SectorWorker(QThread):
                         else:
                             chunk["status"] = "red"
                             self._queue_status(i, "red")
+                            try:
+                                self._allocate_file_space(filepath, self.chunk_size_bytes)
+                            except Exception:
+                                pass
                             self.log_message.emit('info',
                                 f"BAD chunk {i + 1}/{self.total_chunks} "
                                 f"(all {self._max_write_attempts} attempts exceeded "
@@ -433,6 +467,10 @@ class SectorWorker(QThread):
                             else:
                                 chunk["status"] = "red"
                                 self._queue_status(i, "red")
+                                try:
+                                    self._allocate_file_space(filepath, self.chunk_size_bytes)
+                                except Exception:
+                                    pass
                                 self.log_message.emit('warning',
                                     f"FAILED chunk {i + 1}/{self.total_chunks}: {result['error']}"
                                 )
@@ -452,6 +490,10 @@ class SectorWorker(QThread):
                     else:
                         chunk["status"] = "red"
                         self._queue_status(i, "red")
+                        try:
+                            self._allocate_file_space(filepath, self.chunk_size_bytes)
+                        except Exception:
+                            pass
                         self.log_message.emit('warning',
                             f"FAILED chunk {i + 1}/{self.total_chunks}: {e}"
                         )
