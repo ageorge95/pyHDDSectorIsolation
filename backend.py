@@ -1,9 +1,10 @@
+import ctypes
 import json
 import os
+import threading
 import time
 import win32file
 import win32con
-from datetime import datetime
 from shutil import disk_usage
 from PySide6.QtCore import QThread, Signal
 
@@ -50,6 +51,7 @@ class SectorWorker(QThread):
 
         self._max_write_attempts = 2
         self._retry_delay = 2  # seconds between retries, lets USB cache flush
+        self._max_recovery_wait = 30  # max seconds to wait for drive to recover after interrupted write
 
     # ------------------------------------------------------------------ state
     def save_state(self):
@@ -123,9 +125,119 @@ class SectorWorker(QThread):
             win32con.FILE_FLAG_WRITE_THROUGH,
             None,
         )
+        h_int = int(handle)
         raw_handle = handle.Detach()
         fd = msvcrt.open_osfhandle(raw_handle, os.O_BINARY)
-        return os.fdopen(fd, "wb", 1024 * 1024)  # 1 MB buffer
+        return os.fdopen(fd, "wb", 1024 * 1024), h_int
+
+    @staticmethod
+    def _write_chunk_thread(f, chunk_size_bytes, result_dict):
+        """
+        Thread target: write full chunk in 1 MB blocks, flush, fsync.
+
+        Stores outcome in *result_dict*:
+          completed, write_time, sync_time, error.
+        Any exception (including handle closed from another thread)
+        is caught and stored rather than raised.
+        """
+        try:
+            block_size = 1024 * 1024
+            buf = b'\x00' * block_size
+
+            write_start = time.monotonic()
+            remaining = chunk_size_bytes
+            while remaining > 0:
+                to_write = min(block_size, remaining)
+                f.write(buf[:to_write])
+                remaining -= to_write
+            f.flush()
+            write_time = time.monotonic() - write_start
+
+            sync_start = time.monotonic()
+            os.fsync(f.fileno())
+            sync_time = time.monotonic() - sync_start
+
+            result_dict['completed'] = True
+            result_dict['write_time'] = write_time
+            result_dict['sync_time'] = sync_time
+            result_dict['error'] = None
+        except Exception as e:
+            result_dict['completed'] = False
+            result_dict['write_time'] = 0.0
+            result_dict['sync_time'] = 0.0
+            result_dict['error'] = str(e)
+
+    @staticmethod
+    def _safe_close_handle(h_int, f):
+        """Close the Win32 handle (interrupts pending I/O) then the Python file object."""
+        try:
+            ctypes.windll.kernel32.CloseHandle(h_int)
+        except Exception:
+            pass
+        try:
+            f.close()
+        except Exception:
+            pass
+
+    def _wait_for_drive_ready(self, sectors_dir):
+        """
+        Block until the drive responds to a tiny probe write, or *max_recovery_wait*
+        seconds elapse.
+
+        Uses a plain file write (not WRITE_THROUGH) so that the probe itself
+        is less likely to trigger another firmware-level stall.
+
+        Returns True if the drive became ready, False if it did not.
+        """
+        deadline = time.monotonic() + self._max_recovery_wait
+        while time.monotonic() < deadline:
+            probe = {'completed': False, 'error': None}
+            probe_handle = {'h_int': None, 'f': None}
+            probe_path = os.path.join(sectors_dir, "_probe_.dat")
+
+            def _probe():
+                try:
+                    f, h_int = self._open_write_through(probe_path)
+                    probe_handle['h_int'] = h_int
+                    probe_handle['f'] = f
+                    f.write(b'\x00')
+                    f.flush()
+                    os.fsync(f.fileno())
+                    f.close()
+                    probe_handle['f'] = None
+                    os.remove(probe_path)
+                    probe['completed'] = True
+                except Exception as e:
+                    probe['error'] = str(e)
+                    try:
+                        if os.path.exists(probe_path):
+                            os.remove(probe_path)
+                    except Exception:
+                        pass
+
+            t = threading.Thread(target=_probe, daemon=True)
+            t.start()
+            t.join(timeout=2.0)
+            if t.is_alive():
+                self._safe_close_handle(probe_handle['h_int'], probe_handle['f'])
+                self.log_message.emit('info',
+                    "Drive still busy after interrupted write — waiting for firmware recovery..."
+                )
+                t.join(timeout=1.0)
+                time.sleep(1)
+                continue
+
+            if probe['completed']:
+                return True
+            self.log_message.emit('info',
+                f"Drive probe failed ({probe['error']}), retrying..."
+            )
+            time.sleep(1)
+
+        self.log_message.emit('warning',
+            f"Drive did not recover within {self._max_recovery_wait}s"
+        )
+        return False
 
     def _wait_if_paused(self):
         while self._paused and not self._stopped:
@@ -211,72 +323,127 @@ class SectorWorker(QThread):
 
             passed = False
             for attempt in range(self._max_write_attempts):
+                f = None
+                h_int = None
+                result = {'completed': False, 'write_time': 0.0, 'sync_time': 0.0, 'error': None}
+
                 try:
-                    f = self._open_write_through(filepath)
-                    block_size = 1024 * 1024  # 1 MB
-                    buf = b'\x00' * block_size
+                    f, h_int = self._open_write_through(filepath)
 
-                    # Phase 1: buffered write — data leaves Python, hits storage driver
-                    write_start = datetime.now()
-                    remaining = self.chunk_size_bytes
-                    while remaining > 0:
-                        to_write = min(block_size, remaining)
-                        f.write(buf[:to_write])
-                        remaining -= to_write
-                    f.flush()
-                    write_time = (datetime.now() - write_start).total_seconds()
+                    write_thread = threading.Thread(
+                        target=self._write_chunk_thread,
+                        args=(f, self.chunk_size_bytes, result),
+                        daemon=True,
+                    )
+                    write_thread.start()
+                    write_thread.join(timeout=self.threshold_s)
 
-                    # Phase 2: force to device — wait for platters
-                    sync_start = datetime.now()
-                    os.fsync(f.fileno())
-                    sync_time = (datetime.now() - sync_start).total_seconds()
-                    f.close()
-                    f = None
+                    if write_thread.is_alive():
+                        # --- TIMEOUT: write exceeded threshold, interrupt it ---
+                        self._safe_close_handle(h_int, f)
+                        f = None
+                        h_int = None
+                        write_thread.join(timeout=5.0)
 
-                    total_time = write_time + sync_time
+                        # Wait for drive firmware to stop retrying before next I/O
+                        if not self._wait_for_drive_ready(sectors_dir):
+                            chunk["status"] = "red"
+                            self._queue_status(i, "red")
+                            self.log_message.emit('warning',
+                                f"Drive unresponsive — marking chunk {i + 1}/{self.total_chunks} as BAD"
+                            )
+                            break
 
-                    if total_time < self.threshold_s:
-                        chunk["status"] = "green"
-                        self._queue_status(i, "green")
-                        new_filename = f"GOOD_{chunk['filename']}"
-                        new_filepath = os.path.join(self._sectors_dir(), new_filename)
-                        try:
-                            os.rename(filepath, new_filepath)
-                            chunk["filename"] = new_filename
-                        except Exception as rename_err:
-                            self.log_message.emit('error', f"Could not rename chunk {i + 1}: {rename_err}")
-                        self.log_message.emit('info',
-                            f"GOOD chunk {i + 1}/{self.total_chunks} "
-                            f"(write: {write_time:.3f}s  sync: {sync_time:.3f}s  total: {total_time:.3f}s)"
-                        )
-                        passed = True
-                        break
+                        if attempt < self._max_write_attempts - 1:
+                            if os.path.exists(filepath):
+                                try:
+                                    os.remove(filepath)
+                                except Exception:
+                                    pass
+                            time.sleep(self._retry_delay)
+                            self.log_message.emit('info',
+                                f"Retrying chunk {i + 1}/{self.total_chunks} "
+                                f"(attempt {attempt + 1}: write exceeded {self.threshold_s}s threshold)"
+                            )
+                            continue
+                        else:
+                            chunk["status"] = "red"
+                            self._queue_status(i, "red")
+                            self.log_message.emit('info',
+                                f"BAD chunk {i + 1}/{self.total_chunks} "
+                                f"(all {self._max_write_attempts} attempts exceeded "
+                                f"{self.threshold_s}s threshold)"
+                            )
 
-                    if attempt < self._max_write_attempts - 1:
-                        os.remove(filepath)
-                        time.sleep(self._retry_delay)
-                        self.log_message.emit('info',
-                            f"Retrying chunk {i + 1}/{self.total_chunks} "
-                            f"(attempt {attempt + 1}: write: {write_time:.3f}s  sync: {sync_time:.3f}s  "
-                            f"total: {total_time:.3f}s, threshold: {self.threshold_s}s)"
-                        )
                     else:
-                        chunk["status"] = "red"
-                        self._queue_status(i, "red")
-                        self.log_message.emit('info',
-                            f"BAD chunk {i + 1}/{self.total_chunks} "
-                            f"(write: {write_time:.3f}s  sync: {sync_time:.3f}s  total: {total_time:.3f}s, "
-                            f"threshold: {self.threshold_s}s, "
-                            f"all {self._max_write_attempts} attempts exceeded threshold)"
-                        )
+                        # --- COMPLETED: thread finished within threshold ---
+                        f.close()
+                        f = None
+
+                        if result['completed']:
+                            total_time = result['write_time'] + result['sync_time']
+
+                            if total_time < self.threshold_s:
+                                chunk["status"] = "green"
+                                self._queue_status(i, "green")
+                                new_filename = f"GOOD_{chunk['filename']}"
+                                new_filepath = os.path.join(sectors_dir, new_filename)
+                                try:
+                                    os.rename(filepath, new_filepath)
+                                    chunk["filename"] = new_filename
+                                except Exception as rename_err:
+                                    self.log_message.emit('error', f"Could not rename chunk {i + 1}: {rename_err}")
+                                self.log_message.emit('info',
+                                    f"GOOD chunk {i + 1}/{self.total_chunks} "
+                                    f"(write: {result['write_time']:.3f}s  sync: {result['sync_time']:.3f}s  "
+                                    f"total: {total_time:.3f}s)"
+                                )
+                                passed = True
+                                break
+                            else:
+                                if attempt < self._max_write_attempts - 1:
+                                    if os.path.exists(filepath):
+                                        os.remove(filepath)
+                                    time.sleep(self._retry_delay)
+                                    self.log_message.emit('info',
+                                        f"Retrying chunk {i + 1}/{self.total_chunks} "
+                                        f"(attempt {attempt + 1}: total {total_time:.3f}s >= {self.threshold_s}s)"
+                                    )
+                                    continue
+                                else:
+                                    chunk["status"] = "red"
+                                    self._queue_status(i, "red")
+                                    self.log_message.emit('info',
+                                        f"BAD chunk {i + 1}/{self.total_chunks} "
+                                        f"(total {total_time:.3f}s >= {self.threshold_s}s)"
+                                    )
+                        else:
+                            # Thread completed with an exception
+                            if os.path.exists(filepath):
+                                try:
+                                    os.remove(filepath)
+                                except Exception:
+                                    pass
+                            if attempt < self._max_write_attempts - 1:
+                                time.sleep(self._retry_delay)
+                                self.log_message.emit('info',
+                                    f"Retrying chunk {i + 1}/{self.total_chunks} "
+                                    f"(attempt {attempt + 1} failed: {result['error']})"
+                                )
+                            else:
+                                chunk["status"] = "red"
+                                self._queue_status(i, "red")
+                                self.log_message.emit('warning',
+                                    f"FAILED chunk {i + 1}/{self.total_chunks}: {result['error']}"
+                                )
 
                 except Exception as e:
+                    if os.path.exists(filepath):
+                        try:
+                            os.remove(filepath)
+                        except Exception:
+                            pass
                     if attempt < self._max_write_attempts - 1:
-                        if os.path.exists(filepath):
-                            try:
-                                os.remove(filepath)
-                            except Exception:
-                                pass
                         time.sleep(self._retry_delay)
                         self.log_message.emit('info',
                             f"Retrying chunk {i + 1}/{self.total_chunks} "
