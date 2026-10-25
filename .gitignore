@@ -7,3 +7,5 @@
 /session_state.json
 /.__runtime_log.lock
 /runtime_log.log
+/activate.ps1
+/activate.sh

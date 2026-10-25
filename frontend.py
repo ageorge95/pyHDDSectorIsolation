@@ -1,5 +1,6 @@
 import math
 import os
+import sys
 from PySide6.QtCore import Slot, QTimer
 from PySide6.QtGui import QColor, QPainter, QIcon, QImage
 from PySide6.QtWidgets import (
@@ -28,11 +29,12 @@ COLORS = {
     "red": QColor(220, 50, 50),
 }
 
+ICON_FILE = 'icon.ico'
+
 def get_running_path(relative_path):
-    if '_internal' in os.listdir():
-        return os.path.join('_internal', relative_path)
-    else:
-        return relative_path
+    """Return a bundled file's path in both source and PyInstaller builds."""
+    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
 
 class SectorGridWidget(QWidget):
     """
@@ -160,7 +162,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("HDD Sector Isolator")
         self.setWindowTitle("HDD Sector Isolator v" + open(get_running_path('version.txt')).read())
-        self.setWindowIcon(QIcon(get_running_path('icon.ico')))
+        self.setWindowIcon(QIcon(get_running_path(ICON_FILE)))
         self.setMinimumSize(700, 650)
         self.resize(900, 800)
 
