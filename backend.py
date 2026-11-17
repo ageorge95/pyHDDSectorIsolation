@@ -1,4 +1,5 @@
 import ctypes
+import hashlib
 import json
 import os
 import threading
@@ -14,10 +15,11 @@ MB = 1024 * 1024
 
 class SectorWorker(QThread):
     """
-    Single‑phase sector isolation worker.
+    Write -> read-back -> verify sector isolation worker.
 
-    Writes full‑size dummy files while measuring write time.
-    Squares go White -> Green (fast) or Red (slow / fail).
+    Writes full-size dummy files while measuring write time, then reads them
+    back and verifies via checksum. Squares go White -> Yellow (write OK, read
+    back pending) -> Green (verified good) or Red/Violet (bad sector).
     """
 
     # Signal(list of (int, str)) — batched chunk updates
@@ -29,14 +31,15 @@ class SectorWorker(QThread):
     # Signal()
     work_finished = Signal()
 
-    def __init__(self, disk_path, chunk_size_mb, threshold_s, parent=None):
+    def __init__(self, disk_path, chunk_size_mb, threshold_s, read_threshold_s=None, parent=None):
         super().__init__(parent)
         self.disk_path = disk_path
         self.chunk_size_bytes = int(chunk_size_mb * MB)
         self.threshold_s = threshold_s
+        self.read_threshold_s = read_threshold_s if read_threshold_s is not None else threshold_s
 
         self.total_chunks = 0
-        # Each entry: {"index": int, "status": "white"|"green"|"red", "filename": str}
+        # Each entry: {"index": int, "status": "white"|"yellow"|"green"|"red"|"violet", "filename": str}
         self.chunks = []
 
         self._paused = False
@@ -59,6 +62,7 @@ class SectorWorker(QThread):
             "disk_path": self.disk_path,
             "chunk_size_mb": self.chunk_size_bytes / MB,
             "threshold_s": self.threshold_s,
+            "read_threshold_s": self.read_threshold_s,
             "total_chunks": self.total_chunks,
             "current_chunk_index": self.current_chunk_index,
             "chunks": self.chunks,
@@ -89,10 +93,14 @@ class SectorWorker(QThread):
     @classmethod
     def from_state(cls, state, parent=None):
         """Reconstruct a worker from saved state."""
+        read_threshold_s = state.get("read_threshold_s")
+        if read_threshold_s is None:
+            read_threshold_s = state.get("threshold_s")
         worker = cls(
             disk_path=state["disk_path"],
             chunk_size_mb=state["chunk_size_mb"],
             threshold_s=state["threshold_s"],
+            read_threshold_s=read_threshold_s,
             parent=parent,
         )
         worker.total_chunks = state["total_chunks"]
@@ -130,8 +138,8 @@ class SectorWorker(QThread):
         fd = msvcrt.open_osfhandle(raw_handle, os.O_BINARY)
         return os.fdopen(fd, "wb", 1024 * 1024), h_int
 
-    @staticmethod
-    def _write_chunk_thread(f, chunk_size_bytes, result_dict):
+    @classmethod
+    def _write_chunk_thread(cls, f, chunk_size_bytes, result_dict):
         """
         Thread target: write full chunk in 1 MB blocks, flush, fsync.
 
@@ -142,14 +150,15 @@ class SectorWorker(QThread):
         """
         try:
             block_size = 1024 * 1024
-            buf = b'\x00' * block_size
 
             write_start = time.monotonic()
             remaining = chunk_size_bytes
+            block_index = 0
             while remaining > 0:
                 to_write = min(block_size, remaining)
-                f.write(buf[:to_write])
+                f.write(cls._pattern_block(block_index, to_write))
                 remaining -= to_write
+                block_index += 1
             f.flush()
             write_time = time.monotonic() - write_start
 
@@ -166,6 +175,108 @@ class SectorWorker(QThread):
             result_dict['write_time'] = 0.0
             result_dict['sync_time'] = 0.0
             result_dict['error'] = str(e)
+
+    # ------------------------------------------------- deterministic data + checksum helpers
+    @staticmethod
+    def _pattern_byte(block_index):
+        # Deterministic byte value per block so the written payload can be checksummed before/after the write.
+        return (block_index * 31 + 7) % 256
+
+    @classmethod
+    def _pattern_block(cls, block_index, size_bytes):
+        return bytes([cls._pattern_byte(block_index)]) * size_bytes
+
+    def _compute_checksum(self):
+        # SHA-256 over the deterministic chunk data, computed BEFORE writing to disk.
+        h = hashlib.sha256()
+        remaining = self.chunk_size_bytes
+        block_index = 0
+        while remaining > 0:
+            to_write = min(1024 * 1024, remaining)
+            h.update(self._pattern_block(block_index, to_write))
+            remaining -= to_write
+            block_index += 1
+        return h.hexdigest()
+
+    @staticmethod
+    def _read_file_thread(f, size_bytes, result_dict):
+        """
+        Thread target: read *size_bytes* from file object *f*, updating the SHA-256 checksum in *result_dict*.
+
+        Stores outcome in *result_dict*:
+          completed, read_time, checksum, error.
+        Any exception is caught and stored rather than raised.
+        """
+        try:
+            h = hashlib.sha256()
+            read_start = time.monotonic()
+            remaining = size_bytes
+            while remaining > 0:
+                to_read = min(1024 * 1024, remaining)
+                data = f.read(to_read)
+                if data is None or len(data) < to_read:
+                    raise IOError("Short read from file")
+                h.update(data)
+                remaining -= to_read
+            result_dict['completed'] = True
+            result_dict['read_time'] = time.monotonic() - read_start
+            result_dict['checksum'] = h.hexdigest()
+            result_dict['error'] = None
+        except Exception as e:
+            result_dict['completed'] = False
+            result_dict['read_time'] = 0.0
+            result_dict['checksum'] = None
+            result_dict['error'] = str(e)
+
+    def _open_read_no_buffer(self, filepath):
+        """
+        Open *filepath* for reading with FILE_FLAG_NO_BUFFERING so the read is
+        served directly from physical platters instead of the OS page cache.
+
+        Returns (file_object, win32_handle) — same convention as _open_write_through.
+        """
+        import msvcrt
+        handle = win32file.CreateFile(
+            filepath,
+            win32con.GENERIC_READ,
+            0,
+            None,
+            win32con.OPEN_EXISTING,
+            win32con.FILE_FLAG_NO_BUFFERING,
+            None,
+        )
+        h_int = int(handle)
+        raw_handle = handle.Detach()
+        fd = msvcrt.open_osfhandle(raw_handle, os.O_RDONLY)
+        f = os.fdopen(fd, "rb")
+        return f, h_int
+
+    def _read_back(self, filepath, expected_checksum_hex):
+        """
+        Read back *filepath* and verify it against *expected_checksum_hex*
+        (SHA-256 computed before writing to disk).
+
+        The file is opened with FILE_FLAG_NO_BUFFERING so the read is served
+        from physical platters rather than the OS page cache.
+
+        Returns 'ok', 'mismatch' or 'failed'.
+        """
+        result = {'completed': False, 'read_time': 0.0, 'checksum': None, 'error': None}
+        f = None
+        h_int = None
+        f, h_int = self._open_read_no_buffer(filepath)
+        t = threading.Thread(target=self._read_file_thread, args=(f, self.chunk_size_bytes, result), daemon=True)
+        t.start()
+        t.join(timeout=self.read_threshold_s)
+        if t.is_alive():
+            self._safe_close_handle(h_int, f)
+            return 'failed'
+        self._safe_close_handle(h_int, f)
+        if not result['completed']:
+            return 'failed'
+        if result['checksum'] != expected_checksum_hex:
+            return 'mismatch'
+        return 'ok'
 
     @staticmethod
     def _safe_close_handle(h_int, f):
@@ -331,7 +442,7 @@ class SectorWorker(QThread):
         if resume_batch:
             self.chunk_status_batch.emit(resume_batch)
 
-        # --------------------------------------------------- Single‑phase: write & time
+        # --------------------------------------------------- Write & verify chunks (write -> read-back -> resolve)
         self.log_message.emit('info', "Writing and verifying chunks...")
         total_work = self.total_chunks
 
@@ -344,12 +455,13 @@ class SectorWorker(QThread):
 
             chunk = self.chunks[i]
 
-            # Skip chunks already done (green or red from a previous run)
-            if chunk["status"] in ("green", "red"):
+            # Skip chunks already done (green, red or violet from a previous run)
+            if chunk["status"] in ("green", "red", "violet"):
                 self.progress_changed.emit(i + 1, total_work)
                 continue
 
             filepath = self._chunk_filepath(chunk)
+            expected_checksum = self._compute_checksum()
 
             passed = False
             for attempt in range(self._max_write_attempts):
@@ -418,19 +530,12 @@ class SectorWorker(QThread):
                             total_time = result['write_time'] + result['sync_time']
 
                             if total_time < self.threshold_s:
-                                chunk["status"] = "green"
-                                self._queue_status(i, "green")
-                                new_filename = f"GOOD_{chunk['filename']}"
-                                new_filepath = os.path.join(sectors_dir, new_filename)
-                                try:
-                                    os.rename(filepath, new_filepath)
-                                    chunk["filename"] = new_filename
-                                except Exception as rename_err:
-                                    self.log_message.emit('error', f"Could not rename chunk {i + 1}: {rename_err}")
+                                chunk["status"] = "yellow"
+                                self._queue_status(i, "yellow")
                                 self.log_message.emit('info',
-                                    f"GOOD chunk {i + 1}/{self.total_chunks} "
+                                    f"Write OK chunk {i + 1}/{self.total_chunks} "
                                     f"(write: {result['write_time']:.3f}s  sync: {result['sync_time']:.3f}s  "
-                                    f"total: {total_time:.3f}s)"
+                                    f"total: {total_time:.3f}s) - awaiting read-back verification"
                                 )
                                 passed = True
                                 break
@@ -447,6 +552,15 @@ class SectorWorker(QThread):
                                 else:
                                     chunk["status"] = "red"
                                     self._queue_status(i, "red")
+                                    try:
+                                        if os.path.exists(filepath):
+                                            os.remove(filepath)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        self._allocate_file_space(filepath, self.chunk_size_bytes)
+                                    except Exception:
+                                        pass
                                     self.log_message.emit('info',
                                         f"BAD chunk {i + 1}/{self.total_chunks} "
                                         f"(total {total_time:.3f}s >= {self.threshold_s}s)"
@@ -504,6 +618,63 @@ class SectorWorker(QThread):
                         except Exception:
                             pass
 
+            if chunk["status"] == "red":
+                # Write phase failed -> bad sector already handled, move on
+                self.progress_changed.emit(i + 1, total_work)
+                continue
+
+            # ----- Write phase completed OK (chunk currently marked yellow) -> read-back verification -----
+            outcome = self._read_back(filepath, expected_checksum)
+
+            if outcome == "ok":
+                # Read-back checksum matched -> sector is good
+                chunk["status"] = "green"
+                self._queue_status(i, "green")
+                new_filename = f"GOOD_{chunk['filename']}"
+                new_filepath = os.path.join(sectors_dir, new_filename)
+                try:
+                    os.rename(filepath, new_filepath)
+                    chunk["filename"] = new_filename
+                except Exception as rename_err:
+                    self.log_message.emit('error', f"Could not rename chunk {i + 1}: {rename_err}")
+                self.log_message.emit('info',
+                    f"GOOD chunk {i + 1}/{self.total_chunks} "
+                    f"(write: {result['write_time']:.3f}s  sync: {result['sync_time']:.3f}s  "
+                    f"total: {total_time:.3f}s, read-back checksum OK)"
+                )
+            elif outcome == "mismatch":
+                # Checksum mismatch -> treat as sector failure (violet)
+                chunk["status"] = "violet"
+                self._queue_status(i, "violet")
+                try:
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                except Exception:
+                    pass
+                try:
+                    self._allocate_file_space(filepath, self.chunk_size_bytes)
+                except Exception:
+                    pass
+                self.log_message.emit('warning',
+                    f"BAD chunk {i + 1}/{self.total_chunks} (read-back checksum mismatch)"
+                )
+            else:
+                # Read-back failed -> treat as sector failure (red)
+                chunk["status"] = "red"
+                self._queue_status(i, "red")
+                try:
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                except Exception:
+                    pass
+                try:
+                    self._allocate_file_space(filepath, self.chunk_size_bytes)
+                except Exception:
+                    pass
+                self.log_message.emit('warning',
+                    f"BAD chunk {i + 1}/{self.total_chunks} (read-back failed: {outcome})"
+                )
+
             self.progress_changed.emit(i + 1, total_work)
 
         self._flush_batch()
@@ -511,7 +682,7 @@ class SectorWorker(QThread):
 
         # Final summary
         good = sum(1 for c in self.chunks if c["status"] == "green")
-        bad = sum(1 for c in self.chunks if c["status"] == "red")
+        bad = sum(1 for c in self.chunks if c["status"] in ("red", "violet"))
         self.log_message.emit('info', f"Summary: {good} GOOD, {bad} BAD out of {self.total_chunks}")
 
     # --------------------------------------------------------------- controls

@@ -27,6 +27,8 @@ COLORS = {
     "white": QColor(220, 220, 220),
     "green": QColor(50, 200, 50),
     "red": QColor(220, 50, 50),
+    "yellow": QColor(220, 180, 50),
+    "violet": QColor(150, 50, 200),
 }
 
 ICON_FILE = 'icon.ico'
@@ -51,6 +53,8 @@ class SectorGridWidget(QWidget):
         "white":  0xFF_DC_DC_DC,
         "green":  0xFF_32_C8_32,
         "red":    0xFF_DC_32_32,
+        "yellow": 0xFF_DC_B4_32,
+        "violet": 0xFF_96_32_C8,
     }
 
     def __init__(self, parent=None):
@@ -211,6 +215,14 @@ class MainWindow(QMainWindow):
         self.threshold_spin.setSingleStep(0.1)
         settings_layout.addWidget(self.threshold_spin)
 
+        settings_layout.addWidget(QLabel("Read Bad Threshold (s):"))
+        self.read_threshold_spin = QDoubleSpinBox()
+        self.read_threshold_spin.setRange(0.1, 60.0)
+        self.read_threshold_spin.setValue(1.0)
+        self.read_threshold_spin.setDecimals(2)
+        self.read_threshold_spin.setSingleStep(0.1)
+        settings_layout.addWidget(self.read_threshold_spin)
+
         settings_layout.addStretch()
         main_layout.addLayout(settings_layout)
 
@@ -279,7 +291,7 @@ class MainWindow(QMainWindow):
 
         # Check if the session is already fully complete
         chunks = state.get("chunks", [])
-        all_done = all(c["status"] in ("green", "red") for c in chunks) and len(chunks) > 0
+        all_done = all(c["status"] in ("green", "red", "violet") for c in chunks) and len(chunks) > 0
         if all_done:
             # Session was completed — just show results, don't auto-resume
             self.path_input.setText(state["disk_path"])
@@ -289,6 +301,9 @@ class MainWindow(QMainWindow):
             for chunk in chunks:
                 self.grid_widget.set_chunk_status(chunk["index"], chunk["status"])
             self.grid_widget._schedule_repaint()
+            read_threshold = float(state.get("read_threshold_s") or state.get("threshold_s") or 1.0)
+            self.read_threshold_spin.setValue(read_threshold)
+
             total_work = state["total_chunks"]
             self.progress_bar.setMaximum(total_work)
             self.progress_bar.setValue(total_work)
@@ -320,6 +335,9 @@ class MainWindow(QMainWindow):
             for chunk in state["chunks"]:
                 self.grid_widget.set_chunk_status(chunk["index"], chunk["status"])
             self.grid_widget._schedule_repaint()
+
+            read_threshold = float(state.get("read_threshold_s") or state.get("threshold_s") or 1.0)
+            self.read_threshold_spin.setValue(read_threshold)
 
             # Restore progress bar
             total_work = state["total_chunks"]
@@ -375,8 +393,9 @@ class MainWindow(QMainWindow):
 
         chunk_mb = self.chunk_spin.value()
         threshold = self.threshold_spin.value()
+        read_threshold = self.read_threshold_spin.value()
 
-        self.worker = SectorWorker(disk_path, chunk_mb, threshold, parent=None)
+        self.worker = SectorWorker(disk_path, chunk_mb, threshold, read_threshold, parent=None)
         self._setup_worker_signals()
 
         # Grid will be set up once we know total_chunks (after worker starts)
@@ -473,6 +492,7 @@ class MainWindow(QMainWindow):
         self.browse_btn.setEnabled(not running)
         self.chunk_spin.setEnabled(not running)
         self.threshold_spin.setEnabled(not running)
+        self.read_threshold_spin.setEnabled(not running)
         self.start_btn.setEnabled(not running)
 
         self.pause_btn.setEnabled(running)

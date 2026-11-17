@@ -9,10 +9,13 @@ Windows desktop utility (PySide6) for stress-writing disk space in fixed-size ch
 - Splits free space on a selected target path into chunks (default: 40 MB).
 - Runs a **2-phase scan**:
   - **Phase 1 - Allocation:** creates chunk files to reserve space (`white -> yellow`).
-  - **Phase 2 - Verification:** writes each chunk and measures write time (`yellow -> green/red`).
+  - **Phase 2 - Verification:** writes each chunk and measures write time; on success marks the chunk `yellow` (`write OK, awaiting read-back`), then **reads the file back** and verifies it via **SHA-256 checksum**.
 - Marks chunks as:
-  - `green` = write time below threshold
-  - `red` = write failed or exceeded threshold
+  - `green` = write OK and read-back checksum OK (sector good)
+  - `violet` = read-back checksum mismatch (sector bad)
+  - `red` = write failed or read-back failed (sector bad)
+- The written payload uses a deterministic pattern, so its SHA-256 checksum is computed before writing to disk and compared after reading back (no extra read needed to compute the hash).
+- The read-back verification opens the file through a Win32 handle with `FILE_FLAG_NO_BUFFERING`, so reads are served from physical platters instead of the OS page cache.
 - Persists progress to `session_state.json` so interrupted sessions can be resumed.
 
 ## Important warning
@@ -59,7 +62,8 @@ python .\main.py
 1. Select a valid target folder/disk path.
 2. Set chunk size (MB).
 3. Set bad threshold (seconds).
-4. Click **Start**.
+4. Set read bad threshold (seconds, applied to the read-back verification).
+5. Click **Start**.
 5. Optional during run:
    - **Pause/Resume**
    - **Stop** (state is saved)
