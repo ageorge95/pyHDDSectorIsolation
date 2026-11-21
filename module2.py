@@ -38,6 +38,7 @@ ICON_FILE = "icon.ico"
 VERSION_FILE = "version.txt"
 STAGE1_FILE = "stage1.json"
 STAGE2_FILE = "stage2.json"
+RENAME_SETTINGS_FILE = "rename_settings.json"
 
 RED = QColor(220, 50, 50)
 GREEN = QColor(50, 200, 50)
@@ -442,6 +443,72 @@ def rename_bad_files(sectors_dir, bad_files):
     return {"renamed": renamed, "already": already, "failures": failures}
 
 
+RENAME_SETTING_NUMERIC_KEYS = (
+    "min_write_speed_mbps",
+    "max_write_time_s",
+    "min_read_speed_mbps",
+    "max_read_time_s",
+)
+RENAME_SETTING_BOOLEAN_KEYS = (
+    "ghost_bad",
+    "read_failure_bad",
+    "hash_mismatch_bad",
+)
+RENAME_SETTINGS_KEYS = RENAME_SETTING_NUMERIC_KEYS + RENAME_SETTING_BOOLEAN_KEYS
+
+DEFAULT_RENAME_SETTINGS = {
+    "min_write_speed_mbps": 1.0,
+    "max_write_time_s": 30.0,
+    "min_read_speed_mbps": 1.0,
+    "max_read_time_s": 30.0,
+    "ghost_bad": True,
+    "read_failure_bad": True,
+    "hash_mismatch_bad": True,
+}
+
+
+def rename_settings_path(app_root):
+    return os.path.join(app_root, RENAME_SETTINGS_FILE)
+
+
+def load_rename_settings(app_root):
+    """Return the saved rename settings, or None when there are none/invalid."""
+    path = rename_settings_path(app_root)
+    try:
+        with open(path, "r", encoding="utf-8") as file_object:
+            data = json.load(file_object)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    settings = {}
+    for key in RENAME_SETTING_NUMERIC_KEYS:
+        value = data.get(key)
+        settings[key] = (
+            value if _is_number(value) else DEFAULT_RENAME_SETTINGS[key]
+        )
+    for key in RENAME_SETTING_BOOLEAN_KEYS:
+        value = data.get(key)
+        settings[key] = (
+            value if isinstance(value, bool) else DEFAULT_RENAME_SETTINGS[key]
+        )
+    return settings
+
+
+def save_rename_settings(app_root, settings):
+    """Persist the rename settings; failures are logged, not fatal."""
+    path = rename_settings_path(app_root)
+    try:
+        with open(path, "w", encoding="utf-8") as file_object:
+            json.dump(settings, file_object, indent=2)
+            file_object.write("\n")
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "Could not save rename settings to %s: %s", path, exc
+        )
+
+
 class SectorGridWidget(QWidget):
     """One pixel per file, scaled to the widget with nearest-neighbour drawing."""
 
@@ -633,6 +700,7 @@ class MainWindow(QMainWindow):
         self.resize(1050, 850)
 
         self._build_ui()
+        self._load_rename_settings()
         self._set_analysis_enabled(False)
 
     def _build_ui(self):
@@ -699,16 +767,24 @@ class MainWindow(QMainWindow):
         thresholds_group = QGroupBox("Classification Thresholds")
         thresholds_layout = QGridLayout(thresholds_group)
         thresholds_layout.addWidget(QLabel("Min Write Speed (MB/s):"), 0, 0)
-        self.min_write_speed_spin = self._make_speed_spin(1.0)
+        self.min_write_speed_spin = self._make_speed_spin(
+            DEFAULT_RENAME_SETTINGS["min_write_speed_mbps"]
+        )
         thresholds_layout.addWidget(self.min_write_speed_spin, 0, 1)
         thresholds_layout.addWidget(QLabel("Max Write Time (s):"), 0, 2)
-        self.max_write_time_spin = self._make_time_spin(30.0)
+        self.max_write_time_spin = self._make_time_spin(
+            DEFAULT_RENAME_SETTINGS["max_write_time_s"]
+        )
         thresholds_layout.addWidget(self.max_write_time_spin, 0, 3)
         thresholds_layout.addWidget(QLabel("Min Read Speed (MB/s):"), 1, 0)
-        self.min_read_speed_spin = self._make_speed_spin(1.0)
+        self.min_read_speed_spin = self._make_speed_spin(
+            DEFAULT_RENAME_SETTINGS["min_read_speed_mbps"]
+        )
         thresholds_layout.addWidget(self.min_read_speed_spin, 1, 1)
         thresholds_layout.addWidget(QLabel("Max Read Time (s):"), 1, 2)
-        self.max_read_time_spin = self._make_time_spin(30.0)
+        self.max_read_time_spin = self._make_time_spin(
+            DEFAULT_RENAME_SETTINGS["max_read_time_s"]
+        )
         thresholds_layout.addWidget(self.max_read_time_spin, 1, 3)
 
         self.ghost_bad_checkbox = QCheckBox("Ghost Files → BAD")
@@ -859,6 +935,41 @@ class MainWindow(QMainWindow):
         self.bad_list.setEnabled(enabled)
         self.confirm_btn.setEnabled(enabled)
 
+    # --------------------------------------------------------------- rename settings
+    def _current_rename_settings(self):
+        return {
+            "min_write_speed_mbps": self.min_write_speed_spin.value(),
+            "max_write_time_s": self.max_write_time_spin.value(),
+            "min_read_speed_mbps": self.min_read_speed_spin.value(),
+            "max_read_time_s": self.max_read_time_spin.value(),
+            "ghost_bad": self.ghost_bad_checkbox.isChecked(),
+            "read_failure_bad": self.read_failure_bad_checkbox.isChecked(),
+            "hash_mismatch_bad": self.hash_mismatch_bad_checkbox.isChecked(),
+        }
+
+    def _apply_rename_settings(self, settings):
+        self.min_write_speed_spin.setValue(settings["min_write_speed_mbps"])
+        self.max_write_time_spin.setValue(settings["max_write_time_s"])
+        self.min_read_speed_spin.setValue(settings["min_read_speed_mbps"])
+        self.max_read_time_spin.setValue(settings["max_read_time_s"])
+        self.ghost_bad_checkbox.setChecked(settings["ghost_bad"])
+        self.read_failure_bad_checkbox.setChecked(
+            settings["read_failure_bad"]
+        )
+        self.hash_mismatch_bad_checkbox.setChecked(
+            settings["hash_mismatch_bad"]
+        )
+
+    def _load_rename_settings(self):
+        settings = load_rename_settings(get_app_root())
+        if settings is not None:
+            self._apply_rename_settings(settings)
+
+    def _save_rename_settings(self):
+        save_rename_settings(
+            get_app_root(), self._current_rename_settings()
+        )
+
     # --------------------------------------------------------------- views
     def _set_view(self, view):
         self._current_view = view
@@ -918,6 +1029,7 @@ class MainWindow(QMainWindow):
             QApplication.quit()
             return
 
+        self._save_rename_settings()
         total_bad = len(self._bad_files)
         result = rename_bad_files(self._sectors_dir, self._bad_files)
         summary_lines = [
